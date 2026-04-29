@@ -4,6 +4,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { randomBytes, timingSafeEqual } from 'crypto';
 import { createClient, bidToMid } from './weibo.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts } from './db.js';
 
@@ -23,6 +24,64 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors());
 app.use(express.json());
+
+// ── Simple token auth ──────────────────────────────────────────────────────
+const AUTH_USER = process.env.ADMIN_USER;
+const AUTH_PASS = process.env.ADMIN_PASS;
+const authEnabled = !!(AUTH_USER && AUTH_PASS);
+
+// In-memory token store: token -> expiry timestamp
+const tokens = new Map();
+const TOKEN_TTL = 8 * 60 * 60 * 1000; // 8 hours
+
+function issueToken() {
+  const token = randomBytes(32).toString('hex');
+  tokens.set(token, Date.now() + TOKEN_TTL);
+  return token;
+}
+
+function isValidToken(token) {
+  if (!token) return false;
+  const expiry = tokens.get(token);
+  if (!expiry) return false;
+  if (Date.now() > expiry) { tokens.delete(token); return false; }
+  return true;
+}
+
+function requireAuth(req, res, next) {
+  if (!authEnabled) return next();
+  const token = req.headers['x-auth-token'];
+  if (isValidToken(token)) return next();
+  res.status(401).json({ ok: false, error: 'Not authenticated' });
+}
+
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body ?? {};
+  if (!authEnabled) return res.json({ ok: true, token: null });
+  try {
+    const userMatch = timingSafeEqual(Buffer.from(username ?? ''), Buffer.from(AUTH_USER));
+    const passMatch = timingSafeEqual(Buffer.from(password ?? ''), Buffer.from(AUTH_PASS));
+    if (userMatch && passMatch) {
+      return res.json({ ok: true, token: issueToken() });
+    }
+  } catch { /* length mismatch = no match */ }
+  res.status(401).json({ ok: false, error: '用户名或密码错误' });
+});
+
+app.post('/api/logout', (req, res) => {
+  const token = req.headers['x-auth-token'];
+  if (token) tokens.delete(token);
+  res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  const token = req.headers['x-auth-token'];
+  res.json({ ok: true, authenticated: !authEnabled || isValidToken(token) });
+});
+
+// Protect all API routes after this point
+app.use('/api/', requireAuth);
+// ──────────────────────────────────────────────────────────────────────────
 
 // helper: get account index from request (header or body)
 function accountIdx(req) {

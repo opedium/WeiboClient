@@ -88,7 +88,7 @@ export function createClient(cookieOrIndex = 0, cookieList = null) {
     }).then(r => r.data);
 
   return {
-    accountCount: cookies.length,
+    accountCount: 1,
 
     postTweet({ content, pid = '', mid = '', videoTitle = '', videoType = 0 }) {
       const mediaInfo = mid ? JSON.stringify({

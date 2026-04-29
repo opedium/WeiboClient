@@ -3,8 +3,10 @@ import { OPERATIONS, GROUPS, RANDOM_SUPPORTED_OPS } from './config.js';
 
 const API = '';  // proxied via vite to http://localhost:3001
 
+function getToken() { return localStorage.getItem('auth_token') || ''; }
+
 async function callApi(op, formData, account) {
-  const headers = { 'x-account': String(account) };
+  const headers = { 'x-account': String(account), 'x-auth-token': getToken() };
 
   if (op.method === 'UPLOAD') {
     const body = new FormData();
@@ -52,7 +54,7 @@ function AccountsPanel({ onCountChange }) {
   const [validResults, setValidResults] = useState({}); // {index: {valid, name, uid, avatar, error, missingRec}}
 
   useEffect(() => {
-    fetch('/api/accounts').then(r => r.json()).then(d => {
+    fetch('/api/accounts', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) setAccounts(d.accounts ?? []);
     }).catch(() => {});
   }, []);
@@ -77,7 +79,7 @@ function AccountsPanel({ onCountChange }) {
     try {
       const res = await fetch('/api/validate-cookie', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ cookie }),
       });
       let data;
@@ -103,7 +105,7 @@ function AccountsPanel({ onCountChange }) {
     try {
       const res = await fetch('/api/accounts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ accounts }),
       });
       const data = await res.json();
@@ -190,7 +192,7 @@ function CopywritingPanel() {
   const [editName, setEditName] = useState('');
 
   useEffect(() => {
-    fetch('/api/copywriting').then(r => r.json()).then(d => {
+    fetch('/api/copywriting', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) {
         setGroups(d.groups ?? []);
         setActiveIdx(0);
@@ -202,7 +204,7 @@ function CopywritingPanel() {
     try {
       const res = await fetch('/api/copywriting', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ groups }),
       });
       const data = await res.json();
@@ -355,7 +357,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   // load group names when random is toggled on
   useEffect(() => {
     if (useRandom && copyGroups.length === 0) {
-      fetch('/api/copywriting').then(r => r.json()).then(d => {
+      fetch('/api/copywriting', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
         if (d.ok) setCopyGroups(d.groups ?? []);
       }).catch(() => {});
     }
@@ -389,7 +391,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
       if (batchMode) {
         const res = await fetch('/api/batch-stream', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify({
             endpoint: op.endpoint,
             body: { ...values, useRandom: canRandom && useRandom, randomField: 'content', randomGroup: randomGroup || null },
@@ -656,29 +658,112 @@ function OperationForm({ op, account, accountCount, accountNames }) {
 }
 
 export default function App() {
+  const [authed, setAuthed] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginUser, setLoginUser] = useState('');
+  const [loginPass, setLoginPass] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+
   const [selected, setSelected] = useState(OPERATIONS[0]);
   const [showCopywriting, setShowCopywriting] = useState(false);
   const [showAccounts, setShowAccounts] = useState(false);
   const [account, setAccount] = useState(0);
   const [accountCount, setAccountCount] = useState(1);
   const [accountNames, setAccountNames] = useState([]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const refreshAccounts = () => {
-    fetch('/api/accounts').then(r => r.json()).then(d => {
+  // Check if already authenticated
+  useEffect(() => {
+    const token = getToken();
+    if (!token) { setAuthChecked(true); return; }
+    fetch('/api/me', { headers: { 'x-auth-token': token } })
+      .then(r => r.json())
+      .then(d => { if (d.ok) setAuthed(true); })
+      .catch(() => {})
+      .finally(() => setAuthChecked(true));
+  }, []);
+
+  const refreshAccounts = useCallback(() => {
+    fetch('/api/accounts', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) {
         setAccountCount(d.count);
         setAccountNames((d.accounts ?? []).map(a => a.name));
       }
     }).catch(() => {});
+  }, []);
+
+  useEffect(() => { if (authed) refreshAccounts(); }, [authed, refreshAccounts]);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoginLoading(true);
+    setLoginError('');
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginUser, password: loginPass }),
+      });
+      const data = await res.json();
+      if (data.ok && data.token) {
+        localStorage.setItem('auth_token', data.token);
+        setAuthed(true);
+      } else {
+        setLoginError(data.error ?? '登录失败');
+      }
+    } catch {
+      setLoginError('网络错误，请重试');
+    } finally {
+      setLoginLoading(false);
+    }
   };
 
-  useEffect(() => { refreshAccounts(); }, []);
+  const handleLogout = async () => {
+    await fetch('/api/logout', { method: 'POST', headers: { 'x-auth-token': getToken() } }).catch(() => {});
+    localStorage.removeItem('auth_token');
+    setAuthed(false);
+  };
 
-  const selectOp = (op) => { setSelected(op); setShowCopywriting(false); setShowAccounts(false); };
+  const selectOp = (op) => { setSelected(op); setShowCopywriting(false); setShowAccounts(false); setSidebarOpen(false); };
+
+  if (!authChecked) return null;
+
+  if (!authed) {
+    return (
+      <div className="login-overlay">
+        <form className="login-box" onSubmit={handleLogin}>
+          <h2>微博客户端</h2>
+          <input
+            type="text"
+            placeholder="用户名"
+            value={loginUser}
+            onChange={e => setLoginUser(e.target.value)}
+            autoComplete="username"
+            required
+          />
+          <input
+            type="password"
+            placeholder="密码"
+            value={loginPass}
+            onChange={e => setLoginPass(e.target.value)}
+            autoComplete="current-password"
+            required
+          />
+          {loginError && <div className="login-error">{loginError}</div>}
+          <button type="submit" disabled={loginLoading}>
+            {loginLoading ? '登录中…' : '登录'}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="layout">
-      <aside className="sidebar">
+      <button className="hamburger" onClick={() => setSidebarOpen(o => !o)} aria-label="Menu">☰</button>
+      {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />}
+      <aside className={`sidebar${sidebarOpen ? ' open' : ''}`}>
         <div className="sidebar-header">
           <div className="logo">微博客户端</div>
           {accountCount > 1 && (
@@ -711,16 +796,17 @@ export default function App() {
             <div className="nav-group-label">工具</div>
             <button
               className={`nav-item${showAccounts ? ' active' : ''}`}
-              onClick={() => { setShowAccounts(true); setShowCopywriting(false); }}
+              onClick={() => { setShowAccounts(true); setShowCopywriting(false); setSidebarOpen(false); }}
             >
               👤 账号管理
             </button>
             <button
               className={`nav-item${showCopywriting ? ' active' : ''}`}
-              onClick={() => setShowCopywriting(true)}
+              onClick={() => { setShowCopywriting(true); setSidebarOpen(false); }}
             >
               📝 文案库
             </button>
+            <button className="nav-item" onClick={handleLogout}>退出登录</button>
           </div>
         </nav>
       </aside>
