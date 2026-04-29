@@ -6,3 +6,7 @@ test.py
 weibo-app/backend/.env
 node_modules/
 **/node_modules/
+weibo-app/backend/account-names.json
+weibo-app/backend/copywriting.json
+!weibo-app/backend/account-names.example.json
+!weibo-app/backend/copywriting.example.json
