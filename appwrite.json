@@ -1,0 +1,29 @@
+{
+  "projectId": "69f221090023490a8740",
+  "projectName": "Weib0",
+  "functions": [
+    {
+      "$id": "weibo-backend",
+      "name": "weibo-backend",
+      "runtime": "node-22",
+      "execute": ["any"],
+      "path": "weibo-app/backend",
+      "entrypoint": "src/main.js",
+      "buildCommand": "npm install && npm run build",
+      "commands": "cd dist/angular && npm install --production",
+      "timeout": 300,
+      "ignore": [".env", "node_modules", "dist"]
+    }
+  ],
+  "sites": [
+    {
+      "$id": "weibo-frontend",
+      "name": "weibo-frontend",
+      "framework": "vite",
+      "path": "weibo-app/frontend",
+      "buildCommand": "npm install && npm run build",
+      "outputDirectory": "dist",
+      "ignore": ["node_modules", "dist"]
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { OPERATIONS, GROUPS, RANDOM_SUPPORTED_OPS } from './config.js';
 
-const API = '';  // proxied via vite to http://localhost:3001
+const API = import.meta.env.VITE_API_URL ?? '';  // set VITE_API_URL in production
 
 function getToken() { return localStorage.getItem('auth_token') || ''; }
 
@@ -54,7 +54,7 @@ function AccountsPanel({ onCountChange }) {
   const [validResults, setValidResults] = useState({}); // {index: {valid, name, uid, avatar, error, missingRec}}
 
   useEffect(() => {
-    fetch('/api/accounts', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+    fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) setAccounts(d.accounts ?? []);
     }).catch(() => {});
   }, []);
@@ -77,7 +77,7 @@ function AccountsPanel({ onCountChange }) {
     if (!cookie) return;
     setValidating(v => ({ ...v, [i]: true }));
     try {
-      const res = await fetch('/api/validate-cookie', {
+      const res = await fetch(`${API}/api/validate-cookie`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ cookie }),
@@ -103,7 +103,7 @@ function AccountsPanel({ onCountChange }) {
   const save = async () => {
     setSaveError(null);
     try {
-      const res = await fetch('/api/accounts', {
+      const res = await fetch(`${API}/api/accounts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ accounts }),
@@ -192,7 +192,7 @@ function CopywritingPanel() {
   const [editName, setEditName] = useState('');
 
   useEffect(() => {
-    fetch('/api/copywriting', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+    fetch(`${API}/api/copywriting`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) {
         setGroups(d.groups ?? []);
         setActiveIdx(0);
@@ -202,7 +202,7 @@ function CopywritingPanel() {
 
   const save = async () => {
     try {
-      const res = await fetch('/api/copywriting', {
+      const res = await fetch(`${API}/api/copywriting`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ groups }),
@@ -357,7 +357,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   // load group names when random is toggled on
   useEffect(() => {
     if (useRandom && copyGroups.length === 0) {
-      fetch('/api/copywriting', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+      fetch(`${API}/api/copywriting`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
         if (d.ok) setCopyGroups(d.groups ?? []);
       }).catch(() => {});
     }
@@ -389,7 +389,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
     setBatchStatus(null);
     try {
       if (batchMode) {
-        const res = await fetch('/api/batch-stream', {
+        const res = await fetch(`${API}/api/batch-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify({
@@ -401,40 +401,18 @@ function OperationForm({ op, account, accountCount, accountNames }) {
             selectedAccounts: selectedAccounts,
           }),
         });
-        if (!res.ok || !res.body) {
+        if (!res.ok) {
           const text = await res.text();
           let msg;
-          try { msg = JSON.parse(text).error; } catch { msg = `服务器错误 (${res.status})，请重启后端。`; }
+          try { msg = JSON.parse(text).error; } catch { msg = `服务器错误 (${res.status})`; }
           throw new Error(msg);
         }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        const collected = [];
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop(); // keep incomplete line
-          for (const line of lines) {
-            if (!line.startsWith('data:')) continue;
-            const evt = JSON.parse(line.slice(5).trim());
-            if (evt.type === 'start') {
-              setBatchStatus({ current: 0, total: evt.total, waiting: false, remaining: 0 });
-            } else if (evt.type === 'running') {
-              setBatchStatus({ label: `第 ${evt.loop}/${evt.totalRounds} 轮 · ${accountNames?.[evt.account - 1] ?? `账号 ${evt.account}`}`, step: evt.step, total: evt.total, waiting: false, remaining: 0 });
-            } else if (evt.type === 'waiting') {
-              setBatchStatus(s => ({ ...s, label: evt.label, waiting: true, remaining: evt.remaining }));
-            } else if (evt.type === 'result') {
-              collected.push({ account: evt.account, loop: evt.loop, totalRounds: evt.totalRounds, ok: evt.ok, data: evt.data, error: evt.error, pickedContent: evt.pickedContent });
-              setBatchResults([...collected]);
-              setBatchStatus(s => ({ ...s, waiting: false }));
-            } else if (evt.type === 'done') {
-              setBatchStatus(null);
-            }
-          }
-        }
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? '批量操作失败');
+        setBatchResults((data.results ?? []).map(r => ({
+          account: r.account, loop: r.loop ?? 1, totalRounds: r.totalRounds ?? 1,
+          ok: r.ok, data: r.data, error: r.error, pickedContent: r.pickedContent ?? null,
+        })));
       } else {
         const body = canRandom && useRandom
           ? { ...values, useRandom: true, randomField: 'content', randomGroup: randomGroup || null }
@@ -677,7 +655,7 @@ export default function App() {
   useEffect(() => {
     const token = getToken();
     if (!token) { setAuthChecked(true); return; }
-    fetch('/api/me', { headers: { 'x-auth-token': token } })
+    fetch(`${API}/api/me`, { headers: { 'x-auth-token': token } })
       .then(r => r.json())
       .then(d => { if (d.ok) setAuthed(true); })
       .catch(() => {})
@@ -685,7 +663,7 @@ export default function App() {
   }, []);
 
   const refreshAccounts = useCallback(() => {
-    fetch('/api/accounts', { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+    fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok) {
         setAccountCount(d.count);
         setAccountNames((d.accounts ?? []).map(a => a.name));
@@ -700,7 +678,7 @@ export default function App() {
     setLoginLoading(true);
     setLoginError('');
     try {
-      const res = await fetch('/api/login', {
+      const res = await fetch(`${API}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: loginUser, password: loginPass }),
@@ -720,7 +698,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await fetch('/api/logout', { method: 'POST', headers: { 'x-auth-token': getToken() } }).catch(() => {});
+    await fetch(`${API}/api/logout`, { method: 'POST', headers: { 'x-auth-token': getToken() } }).catch(() => {});
     localStorage.removeItem('auth_token');
     setAuthed(false);
   };
