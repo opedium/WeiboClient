@@ -1,0 +1,8 @@
+/logs
+*.pyc
+.idea/
+**/__pycache__
+test.py
+weibo-app/backend/.env
+node_modules/
+**/node_modules/
