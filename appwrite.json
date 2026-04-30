@@ -8,9 +8,9 @@
       "runtime": "node-22",
       "execute": ["any"],
       "path": "weibo-app/backend",
-      "entrypoint": "main.js",
+      "entrypoint": "weibo-app/backend/main.js",
       "buildCommand": "npm install && npm run build",
-      "commands": "cd dist/angular && npm install --production",
+      "commands": "cd weibo-app/backend && npm install",
       "timeout": 300,
       "ignore": [".env", "node_modules", "dist"]
     }
