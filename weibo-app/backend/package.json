@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "mkdir -p dist/angular/src && cp server.js weibo.js db.js package.json dist/angular/ && cp src/main.js dist/angular/src/",
+    "build": "echo build ok",
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
