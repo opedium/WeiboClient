@@ -14,10 +14,9 @@ export default function AuthPage() {
 
   useEffect(() => {
     const token = localStorage.getItem('auth_token');
-    if (!token) { setChecking(false); return; }
-    fetch(`${BACKEND}/api/me`, { headers: { 'x-auth-token': token } })
+    fetch(`${BACKEND}/api/me`, { headers: token ? { 'x-auth-token': token } : {}, credentials: 'include' })
       .then(r => r.json())
-      .then(d => { if (d.ok) setUser(d.user ?? username); })
+      .then(d => { if (d.ok && d.authenticated) setUser(d.user ?? (username || 'admin')); })
       .catch(() => {})
       .finally(() => setChecking(false));
   }, []);
@@ -30,11 +29,12 @@ export default function AuthPage() {
       const res = await fetch(`${BACKEND}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ username, password }),
       });
       const data = await res.json();
-      if (data.ok && data.token) {
-        localStorage.setItem('auth_token', data.token);
+      if (data.ok) {
+        if (data.token) localStorage.setItem('auth_token', data.token);
         setUser(username);
       } else {
         setError(data.error ?? 'Invalid credentials');
@@ -47,6 +47,11 @@ export default function AuthPage() {
   }
 
   function logout() {
+    fetch(`${BACKEND}/api/logout`, {
+      method: 'POST',
+      headers: { 'x-auth-token': localStorage.getItem('auth_token') || '' },
+      credentials: 'include',
+    }).catch(() => {});
     localStorage.removeItem('auth_token');
     setUser(null);
   }

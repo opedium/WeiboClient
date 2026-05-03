@@ -4,3 +4,4 @@ PyExecJS==1.5.1
 opencv-python==4.6.0.66
 w3lib==2.1.1
 PyYAML==6.0
+colorama>=0.4.6

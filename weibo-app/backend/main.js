@@ -1,23 +1,22 @@
 // src/main.js — Appwrite Function entry point
-// Replaces Express server for serverless deployment.
-// Auth uses stateless HMAC tokens (survives cold starts / multiple instances).
-import { createHmac, timingSafeEqual } from 'crypto';
+// Auth: credentials verified against Appwrite (server-side, no CORS restriction).
+// Sessions: stateless HMAC tokens (8 h) — no external call per request.
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 import { createClient, bidToMid } from './weibo.js';
 import {
   getCopywritingGroups, setCopywritingGroups,
   getAccounts, setAccounts,
 } from './db.js';
 
-const AUTH_USER   = process.env.ADMIN_USER   ?? '';
-const AUTH_PASS   = process.env.ADMIN_PASS   ?? '';
-const SECRET      = process.env.COOKIE_SECRET ?? 'change-me';
-const TOKEN_TTL   = 8 * 60 * 60 * 1000; // 8 hours
-const authEnabled = !!(AUTH_USER && AUTH_PASS);
+const APPWRITE_ENDPOINT  = process.env.APPWRITE_ENDPOINT   ?? 'https://sgp.cloud.appwrite.io/v1';
+const APPWRITE_PROJECT   = process.env.APPWRITE_PROJECT_ID ?? '69f221090023490a8740';
+const SECRET             = process.env.COOKIE_SECRET ?? randomBytes(32).toString('hex');
+const TOKEN_TTL          = 8 * 60 * 60 * 1000; // 8 hours
 
-// ── Stateless HMAC token ────────────────────────────────────────────────────
+// ── HMAC session token ───────────────────────────────────────────────────────
 function issueToken() {
   const expiry  = Date.now() + TOKEN_TTL;
-  const payload = `${AUTH_USER}:${expiry}`;
+  const payload = `session:${expiry}`;
   const sig     = createHmac('sha256', SECRET).update(payload).digest('hex');
   return Buffer.from(`${payload}:${sig}`).toString('base64url');
 }
@@ -38,6 +37,25 @@ function isValidToken(token) {
     if (sig.length !== expected.length) return false;
     return timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
   } catch { return false; }
+}
+
+// ── Verify email/password via Appwrite (server-to-server, no CORS check) ─────
+async function verifyAppwriteCredentials(email, password) {
+  if (!email || !password) return { ok: false, error: '缺少邮箱或密码' };
+  try {
+    const r = await fetch(`${APPWRITE_ENDPOINT}/account/sessions/email`, {
+      method: 'POST',
+      headers: {
+        'x-appwrite-project': APPWRITE_PROJECT,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+    });
+    if (r.ok) return { ok: true };
+    const d = await r.json().catch(() => ({}));
+    const isCredErr = (d.type ?? '').includes('invalid_credentials') || (d.message ?? '').toLowerCase().includes('invalid');
+    return { ok: false, error: isCredErr ? '邮箱或密码错误' : (d.message ?? '登录失败') };
+  } catch { return { ok: false, error: '登录失败，请重试' }; }
 }
 
 // ── Request helpers ─────────────────────────────────────────────────────────
@@ -74,6 +92,53 @@ function randomItem(groups, groupName) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+function toOriginalWeibo(status, mid) {
+  if (!status || typeof status !== 'object') return null;
+  const mblogid = status.mblogid ?? null;
+  const uid = status.user?.idstr ?? status.user?.id ?? null;
+  const postId = status.idstr ?? status.id ?? mid;
+  const canonicalUrl = (uid && mblogid) ? `https://weibo.com/${uid}/${mblogid}` : null;
+  return {
+    id: status.id ?? null,
+    idstr: status.idstr ?? null,
+    mblogid,
+    text: status.text_raw ?? status.text ?? '',
+    created_at: status.created_at ?? null,
+    source: status.source ?? null,
+    user: status.user ? {
+      id: status.user.id ?? null,
+      idstr: status.user.idstr ?? null,
+      screen_name: status.user.screen_name ?? status.user.name ?? null,
+      profile_image_url: status.user.profile_image_url ?? null,
+    } : null,
+    url: canonicalUrl ?? (postId ? `https://weibo.com/detail/${postId}` : null),
+  };
+}
+
+async function enrichCommentResult(client, mid, result) {
+  try {
+    const original = await client.fetchStatusDetail({ mid });
+    return { ...result, originalWeibo: toOriginalWeibo(original, mid) };
+  } catch {
+    return result;
+  }
+}
+
+function maskCookie(cookie) {
+  const s = String(cookie ?? '').trim();
+  if (!s) return '';
+  if (s.length <= 12) return `${s.slice(0, 2)}***${s.slice(-2)}`;
+  return `${s.slice(0, 6)}...${s.slice(-6)}`;
+}
+
+function sanitizeAccountsForResponse(accounts) {
+  return (accounts ?? []).map(a => ({
+    name: String(a.name ?? '').trim(),
+    hasCookie: !!String(a.cookie ?? '').trim(),
+    cookieMasked: maskCookie(a.cookie),
+  }));
+}
+
 // ── Wrapped handler (Weibo API with account resolution + random content) ───
 async function runWrapped(req, res, fn) {
   const body = getBody(req);
@@ -101,7 +166,7 @@ const batchHandlers = {
   '/api/post-tweet':         (c, b) => c.postTweet({ content: b.content, pid: b.pid, mid: b.mid, videoTitle: b.videoTitle, videoType: b.videoType }),
   '/api/delete-tweet':       (c, b) => c.deleteTweet({ mid: resolveMid(b.mid) }),
   '/api/quick-repost':       (c, b) => c.quickRepost({ mid: resolveMid(b.mid) }),
-  '/api/repost-tweet':       (c, b) => c.repostTweet({ mid: resolveMid(b.mid), content: b.content }),
+   '/api/repost-tweet':       (c, b) => c.repostTweet({ mid: resolveMid(b.mid), content: b.content, visible: b.visible, listId: b.listId }),
   '/api/comment-tweet':      (c, b) => c.commentTweet({ mid: resolveMid(b.mid), content: b.content }),
   '/api/reply-comment':      (c, b) => c.replyComment({ mid: resolveMid(b.mid), cid: b.cid, content: b.content }),
   '/api/delete-comment':     (c, b) => c.deleteComment({ cid: b.cid }),
@@ -118,20 +183,17 @@ export default async ({ req, res, log, error }) => {
   const method  = (req.method ?? 'GET').toUpperCase();
   const headers = req.headers ?? {};
   const token   = headers['x-auth-token'];
+  const routeKey = `${method} ${path}`;
 
   // CORS preflight
   if (method === 'OPTIONS') return res.empty();
 
   // ── Public routes ─────────────────────────────────────────────────────
   if (path === '/api/login' && method === 'POST') {
-    const { username, password } = getBody(req);
-    if (!authEnabled) return res.json({ ok: true, token: null });
-    try {
-      const userOk = timingSafeEqual(Buffer.from(username ?? ''), Buffer.from(AUTH_USER));
-      const passOk = timingSafeEqual(Buffer.from(password ?? ''), Buffer.from(AUTH_PASS));
-      if (userOk && passOk) return res.json({ ok: true, token: issueToken() });
-    } catch { /* length mismatch = wrong credentials */ }
-    return res.json({ ok: false, error: '用户名或密码错误' }, 401);
+    const { email, password } = getBody(req);
+    const result = await verifyAppwriteCredentials(email, password);
+    if (!result.ok) return res.json({ ok: false, error: result.error }, 401);
+    return res.json({ ok: true, token: issueToken() });
   }
 
   if (path === '/api/logout' && method === 'POST') {
@@ -139,12 +201,12 @@ export default async ({ req, res, log, error }) => {
   }
 
   if (path === '/api/me' && method === 'GET') {
-    return res.json({ ok: true, authenticated: !authEnabled || isValidToken(token) });
+    return res.json({ ok: true, authenticated: isValidToken(token) });
   }
 
-  // ── Auth guard ────────────────────────────────────────────────────────
-  if (authEnabled && !isValidToken(token)) {
-    return res.json({ ok: false, error: 'Not authenticated' }, 401);
+  const isPublicRoute = routeKey === 'POST /api/login' || routeKey === 'POST /api/logout' || routeKey === 'GET /api/me';
+  if (!isPublicRoute && !isValidToken(token)) {
+    return res.json({ ok: false, error: '未授权，请先登录' }, 401);
   }
 
   // ── Accounts ──────────────────────────────────────────────────────────
@@ -152,18 +214,25 @@ export default async ({ req, res, log, error }) => {
     if (method === 'GET') {
       try {
         const accounts = await getAccounts();
-        return res.json({ ok: true, count: accounts.length, accounts });
+        return res.json({ ok: true, count: accounts.length, accounts: sanitizeAccountsForResponse(accounts) });
       } catch (e) { return res.json({ ok: false, error: e.message }, 500); }
     }
     if (method === 'POST') {
       try {
         const { accounts } = getBody(req);
         if (!Array.isArray(accounts)) return res.json({ ok: false, error: 'accounts must be array' }, 400);
+        const existing = await getAccounts();
         const clean = accounts
-          .map(a => ({ cookie: String(a.cookie ?? '').trim(), name: String(a.name ?? '').trim() }))
+          .map((a, i) => {
+            const name = String(a.name ?? '').trim();
+            const incomingCookie = String(a.cookie ?? '').trim();
+            const keepExisting = !!a.keepExisting;
+            const cookie = incomingCookie || (keepExisting ? String(existing[i]?.cookie ?? '').trim() : '');
+            return { cookie, name: name || `账号 ${i + 1}` };
+          })
           .filter(a => a.cookie);
         await setAccounts(clean);
-        return res.json({ ok: true, count: clean.length });
+        return res.json({ ok: true, count: clean.length, accounts: sanitizeAccountsForResponse(clean) });
       } catch (e) { return res.json({ ok: false, error: e.message }, 500); }
     }
   }
@@ -233,9 +302,17 @@ export default async ({ req, res, log, error }) => {
     'POST /api/post-tweet':         (c, b)    => c.postTweet({ content: b.content, pid: b.pid, mid: b.mid, videoTitle: b.videoTitle, videoType: b.videoType }),
     'POST /api/delete-tweet':       (c, b)    => c.deleteTweet({ mid: resolveMid(b.mid) }),
     'POST /api/quick-repost':       (c, b)    => c.quickRepost({ mid: resolveMid(b.mid) }),
-    'POST /api/repost-tweet':       (c, b)    => c.repostTweet({ mid: resolveMid(b.mid), content: b.content }),
-    'POST /api/comment-tweet':      (c, b)    => c.commentTweet({ mid: resolveMid(b.mid), content: b.content }),
-    'POST /api/reply-comment':      (c, b)    => c.replyComment({ mid: resolveMid(b.mid), cid: b.cid, content: b.content }),
+    'POST /api/comment-tweet':      async (c, b) => {
+      const mid = resolveMid(b.mid);
+      const result = await c.commentTweet({ mid, content: b.content });
+      return enrichCommentResult(c, mid, result);
+    },
+    'POST /api/repost-tweet':       (c, b)    => c.repostTweet({ mid: resolveMid(b.mid), content: b.content, visible: b.visible, listId: b.listId }),
+    'POST /api/reply-comment':      async (c, b) => {
+      const mid = resolveMid(b.mid);
+      const result = await c.replyComment({ mid, cid: b.cid, content: b.content });
+      return enrichCommentResult(c, mid, result);
+    },
     'POST /api/delete-comment':     (c, b)    => c.deleteComment({ cid: b.cid }),
     'POST /api/follow-user':        (c, b)    => c.followUser({ uid: b.uid }),
     'POST /api/unfollow-user':      (c, b)    => c.unfollowUser({ uid: b.uid }),
@@ -248,7 +325,6 @@ export default async ({ req, res, log, error }) => {
     'GET /api/groups':              (c)       => c.fetchGroups(),
   };
 
-  const routeKey = `${method} ${path}`;
   if (wrapRoutes[routeKey]) return runWrapped(req, res, wrapRoutes[routeKey]);
 
   // ── Batch (synchronous — no SSE, serverless compatible) ───────────────

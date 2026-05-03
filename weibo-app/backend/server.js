@@ -2,13 +2,23 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import axios from 'axios';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { createClient, bidToMid } from './weibo.js';
-import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts } from './db.js';
+import { refreshCookieViaManualLogin, keepAliveAllAccounts, resetBrowserProfile } from './cookieRefresh.js';
+import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
+         getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.PORT ?? 3001);
+const JSON_LIMIT = process.env.JSON_LIMIT ?? '256kb';
+const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024);
+const CORS_ORIGINS = (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://127.0.0.1:3000')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 function randomItem(groups, groupName) {
   if (!groups || !groups.length) return null;
@@ -20,79 +30,275 @@ function randomItem(groups, groupName) {
 }
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: UPLOAD_MAX_BYTES },
+});
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (CORS_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: JSON_LIMIT }));
 
-// ── Simple token auth ──────────────────────────────────────────────────────
-const AUTH_USER = process.env.ADMIN_USER;
-const AUTH_PASS = process.env.ADMIN_PASS;
-const authEnabled = !!(AUTH_USER && AUTH_PASS);
-
-// In-memory token store: token -> expiry timestamp
-const tokens = new Map();
-const TOKEN_TTL = 8 * 60 * 60 * 1000; // 8 hours
-
-function issueToken() {
-  const token = randomBytes(32).toString('hex');
-  tokens.set(token, Date.now() + TOKEN_TTL);
-  return token;
+function maskCookie(cookie) {
+  const s = String(cookie ?? '').trim();
+  if (!s) return '';
+  if (s.length <= 12) return `${s.slice(0, 2)}***${s.slice(-2)}`;
+  return `${s.slice(0, 6)}...${s.slice(-6)}`;
 }
 
-function isValidToken(token) {
-  if (!token) return false;
-  const expiry = tokens.get(token);
-  if (!expiry) return false;
-  if (Date.now() > expiry) { tokens.delete(token); return false; }
-  return true;
+function compactCookieValue(cookie, uid = '') {
+  const sub = cookieFieldValue(cookie, 'SUB');
+  const normalizedUid = /^\d{10,}$/.test(String(uid)) ? String(uid).slice(0, 10) : '';
+  if (!sub || !normalizedUid) return '';
+  return `${normalizedUid}----${sub}`;
 }
 
-function requireAuth(req, res, next) {
-  if (!authEnabled) return next();
-  const token = req.headers['x-auth-token'];
-  if (isValidToken(token)) return next();
-  res.status(401).json({ ok: false, error: 'Not authenticated' });
+function sanitizeAccountsForResponse(accounts) {
+  return (accounts ?? []).map(a => ({
+    name: String(a.name ?? '').trim(),
+    uid: String(a.uid ?? '').trim(),
+    hasCookie: !!String(a.cookie ?? '').trim(),
+    cookieMasked: maskCookie(a.cookie),
+    cookieCompact: String(a.cookieCompact ?? '').trim() || compactCookieValue(a.cookie, a.uid),
+    proxy: String(a.proxy ?? '').trim(),
+  }));
 }
 
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body ?? {};
-  if (!authEnabled) return res.json({ ok: true, token: null });
-  try {
-    const userMatch = timingSafeEqual(Buffer.from(username ?? ''), Buffer.from(AUTH_USER));
-    const passMatch = timingSafeEqual(Buffer.from(password ?? ''), Buffer.from(AUTH_PASS));
-    if (userMatch && passMatch) {
-      return res.json({ ok: true, token: issueToken() });
+function hasCookieField(cookieStr, key) {
+  return new RegExp(`(?:^|;\\s*)${key}=`).test(cookieStr);
+}
+
+function cookieFieldValue(cookieStr, key) {
+  const match = cookieStr.match(new RegExp(`(?:^|;\\s*)${key}=([^;]+)`));
+  return match?.[1] ?? '';
+}
+
+function checkCookieFields(cookieStr) {
+  const required = ['SUB', 'XSRF-TOKEN'];
+  const recommended = ['SUBP', 'SCF'];
+  const missing = required.filter(k => !hasCookieField(cookieStr, k));
+  const missingRec = recommended.filter(k => !hasCookieField(cookieStr, k));
+  return { missing, missingRec };
+}
+
+function classifyBackendError(err) {
+  const msg = String(err?.message ?? '');
+  const code = String(err?.code ?? '');
+  const status = Number(err?.response?.status ?? 0);
+  // Also check response body for proxy-provider error codes
+  const responseBody = String(err?.response?.data ?? '');
+
+  const timeoutLike = /timeout|timed out|ETIMEDOUT|ECONNABORTED|ERR_TIMED_OUT/i.test(msg) ||
+                      /ETIMEDOUT|ECONNABORTED/i.test(code);
+  if (timeoutLike) {
+    return {
+      type: 'network_timeout',
+      reason: '代理或网络超时',
+      detail: '请求超时，通常是代理不稳定/不可达，或目标站点链路阻塞。',
+    };
+  }
+
+  // Proxy-provider specific error codes (returned in message or response body)
+  const proxyProviderError = /NO_HOST_CONNECTION|PROXY_ERROR|PROXY_CONNECTION|tunneling socket|CONNECT_REFUSED/i.test(msg) ||
+                             /NO_HOST_CONNECTION|PROXY_ERROR/i.test(responseBody);
+  if (proxyProviderError || status === 502 || status === 407) {
+    return {
+      type: 'network_proxy_error',
+      reason: '代理无法连接目标主机',
+      detail: status === 502
+        ? '代理网关返回 502，该代理 IP 可能被目标站点封禁或代理服务器自身故障，请尝试切换代理 IP 或地区。'
+        : status === 407
+        ? '代理认证失败（407），请检查代理用户名/密码。'
+        : `代理服务商返回错误（${msg || responseBody}），该 IP 无法访问目标站点，请更换代理 IP。`,
+    };
+  }
+
+  const connectLike = /ECONNRESET|ECONNREFUSED|ERR_CONNECTION_CLOSED|ENOTFOUND|EHOSTUNREACH|EAI_AGAIN/i.test(msg) ||
+                      /ECONNRESET|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|EAI_AGAIN/i.test(code);
+  if (connectLike) {
+    return {
+      type: 'network_proxy_error',
+      reason: '代理或网络连接失败',
+      detail: '连接被重置/拒绝或 DNS 解析失败，优先检查代理地址、账号认证和网络连通性。',
+    };
+  }
+
+  if (status === 401 || status === 403 || /cookie|session|登录|未登录|invalid/i.test(msg)) {
+    return {
+      type: 'cookie_invalid',
+      reason: 'Cookie 可能失效',
+      detail: '服务端返回鉴权失败，建议先刷新 Cookie 后重试。',
+    };
+  }
+
+  return {
+    type: 'unknown_error',
+    reason: '未知错误',
+    detail: msg || '请求失败',
+  };
+}
+
+async function validateCookieLive(cookieStr, proxy = '') {
+  const xsrf = (() => {
+    const raw = cookieFieldValue(cookieStr, 'XSRF-TOKEN');
+    try { return decodeURIComponent(raw); } catch { return raw; }
+  })();
+  const proxyOpts = (typeof proxy === 'string' && proxy.trim())
+    ? (() => {
+        try {
+          return { httpsAgent: new HttpsProxyAgent(proxy.trim()), proxy: false };
+        } catch {
+          return {};
+        }
+      })()
+    : {};
+  const commonHeaders = {
+    'Cookie': cookieStr,
+    'x-xsrf-token': xsrf,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://weibo.com',
+    'Origin': 'https://weibo.com',
+    'x-requested-with': 'XMLHttpRequest',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+  };
+
+  const tryFetch = async (url) => {
+    const resp = await axios.get(url, {
+      headers: commonHeaders,
+      validateStatus: () => true,
+      ...proxyOpts,
+    });
+    const text = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
+    try { return JSON.parse(text); } catch { return null; }
+  };
+
+  let data = await tryFetch('https://weibo.com/ajax/statuses/mymblog?page=1&feature=0');
+  if (data?.ok === 1) {
+    const user = data?.data?.list?.[0]?.user ?? null;
+    return {
+      valid: true,
+      uid: user?.id ?? null,
+      name: user?.screen_name ?? '已验证',
+      avatar: user?.profile_image_url ?? null,
+      reason: null,
+    };
+  }
+
+  if (hasCookieField(cookieStr, 'SUB')) {
+    data = await tryFetch('https://weibo.com/ajax/profile/info');
+    const user = data?.data?.user;
+    if (user) {
+      return {
+        valid: true,
+        uid: user.id,
+        name: user.screen_name,
+        avatar: user.profile_image_url,
+        reason: null,
+      };
     }
-  } catch { /* length mismatch = no match */ }
-  res.status(401).json({ ok: false, error: '用户名或密码错误' });
-});
+  }
 
-app.post('/api/logout', (req, res) => {
-  const token = req.headers['x-auth-token'];
-  if (token) tokens.delete(token);
-  res.json({ ok: true });
-});
+  return {
+    valid: false,
+    uid: null,
+    name: null,
+    avatar: null,
+    reason: data ? 'Cookie 无效或已过期' : '服务器返回非 JSON 响应',
+  };
+}
 
-app.get('/api/me', (req, res) => {
-  const token = req.headers['x-auth-token'];
-  res.json({ ok: true, authenticated: !authEnabled || isValidToken(token) });
-});
-
-// Protect all API routes after this point
-app.use('/api/', requireAuth);
-// ──────────────────────────────────────────────────────────────────────────
+const refreshLocks = new Set();
 
 // helper: get account index from request (header or body)
 function accountIdx(req) {
   return parseInt(req.headers['x-account'] ?? req.body?.account ?? '0', 10) || 0;
 }
 
-// helper: resolve mid — accepts numeric mid or mblogid string
+// helper: resolve mid — accepts numeric mid, mblogid string, or uid/mblogid
 function resolveMid(val) {
   if (!val) return null;
   const s = String(val).trim();
-  return /^\d+$/.test(s) ? s : bidToMid(s);
+  if (/^\d+$/.test(s)) return s;              // numeric mid
+  if (s.includes('/')) return bidToMid(s.split('/').pop()); // uid/mblogid → extract mblogid
+  return bidToMid(s);                          // plain mblogid
+}
+
+// helper: resolve comment cid from numeric cid or full comment URL
+function resolveCid(val) {
+  if (!val) return null;
+  const s = String(val).trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return s;
+
+  // For reply-comment links, rid is often the real target comment id.
+  const ridMatch = s.match(/[?&]rid=(\d+)/i);
+  if (ridMatch) return ridMatch[1];
+
+  const cidMatch = s.match(/[?&]cid=(\d+)/i);
+  if (cidMatch) return cidMatch[1];
+
+  throw new Error('Invalid CID: provide numeric cid or a URL containing ?cid=');
+}
+
+// helper: resolve comment-like target from cid or full comment URL
+function resolveCommentLikeTarget(val, fallbackMid = null) {
+  const s = String(val ?? '').trim();
+  const cid = resolveCid(s);
+
+  let mid = null;
+  const ridMatch = s.match(/[?&]rid=(\d+)/i);
+  const rid = ridMatch ? ridMatch[1] : null;
+  const tokenMatch = s.match(/weibo\.com\/(?:detail\/)?([^/?#]+)(?:\/([^/?#]+))?/i);
+  const partA = tokenMatch?.[1] ?? null;
+  const partB = tokenMatch?.[2] ?? null;
+
+  // URL patterns:
+  // 1) /detail/<mid>
+  // 2) /<uid>/<mblogid>
+  const postToken = partB || (partA && partA !== 'detail' ? partA : null);
+  if (postToken) {
+    mid = /^\d+$/.test(postToken) ? postToken : bidToMid(postToken);
+  }
+
+  if (!mid && fallbackMid) {
+    mid = resolveMid(fallbackMid);
+  }
+
+  return { cid, rid, mid, hasRid: !!rid };
+}
+
+function toOriginalWeibo(status) {
+  if (!status || typeof status !== 'object') return null;
+  return {
+    id: status.id ?? null,
+    idstr: status.idstr ?? null,
+    mblogid: status.mblogid ?? null,
+    text: status.text_raw ?? status.text ?? '',
+    created_at: status.created_at ?? null,
+    source: status.source ?? null,
+    user: status.user ? {
+      id: status.user.id ?? null,
+      idstr: status.user.idstr ?? null,
+      screen_name: status.user.screen_name ?? status.user.name ?? null,
+      profile_image_url: status.user.profile_image_url ?? null,
+    } : null,
+  };
+}
+
+async function enrichCommentResult(client, mid, result) {
+  try {
+    const original = await client.fetchStatusDetail({ mid });
+    return { ...result, originalWeibo: toOriginalWeibo(original) };
+  } catch {
+    return result;
+  }
 }
 
 function wrap(fn) {
@@ -100,9 +306,9 @@ function wrap(fn) {
     try {
       const accounts = await getAccounts();
       const idx = accountIdx(req);
-      const cookie = accounts[Math.min(idx, accounts.length - 1)]?.cookie;
-      if (!cookie) throw new Error(`Account ${idx} not found`);
-      const client = createClient(cookie);
+      const acc = accounts[Math.min(idx, accounts.length - 1)];
+      if (!acc?.cookie) throw new Error(`Account ${idx} not found`);
+      const client = createClient(acc.cookie, null, acc.proxy || null);
       // resolve random content for single-call routes (same logic as batch)
       if (req.body?.useRandom && req.body?.randomField) {
         const groups = await getCopywritingGroups();
@@ -112,8 +318,13 @@ function wrap(fn) {
       const data = await fn(client, req);
       res.json({ ok: true, data });
     } catch (err) {
-      console.error(err.message);
-      res.status(500).json({ ok: false, error: err.message });
+      const classified = classifyBackendError(err);
+      console.error(`[${classified.type}] ${err.message}`);
+      res.status(500).json({
+        ok: false,
+        error: `${classified.reason}: ${classified.detail}`,
+        errorType: classified.type,
+      });
     }
   };
 }
@@ -122,7 +333,7 @@ function wrap(fn) {
 app.get('/api/accounts', async (req, res) => {
   try {
     const accounts = await getAccounts();
-    res.json({ ok: true, count: accounts.length, accounts });
+    res.json({ ok: true, count: accounts.length, accounts: sanitizeAccountsForResponse(accounts) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -130,13 +341,30 @@ app.get('/api/accounts', async (req, res) => {
 
 app.post('/api/accounts', async (req, res) => {
   try {
-    const { accounts } = req.body;  // [{cookie, name}]
+    const { accounts } = req.body;  // [{cookie, name, proxy}]
     if (!Array.isArray(accounts)) return res.status(400).json({ ok: false, error: 'accounts must be array' });
-    const clean = accounts
-      .map(a => ({ cookie: String(a.cookie ?? '').trim(), name: String(a.name ?? '').trim() }))
-      .filter(a => a.cookie);
+    const existing = await getAccounts();
+    const clean = (await Promise.all(accounts.map(async (a, i) => {
+        const name = String(a.name ?? '').trim();
+        const incomingCookie = String(a.cookie ?? '').trim();
+        const keepExisting = !!a.keepExisting;
+        const cookie = incomingCookie || (keepExisting ? String(existing[i]?.cookie ?? '').trim() : '');
+        const proxy = String(a.proxy ?? '').trim();
+        let uid = keepExisting && !incomingCookie ? String(existing[i]?.uid ?? '').trim() : '';
+
+        if (incomingCookie) {
+          try {
+            const live = await validateCookieLive(cookie, proxy);
+            if (live.valid && live.uid) {
+              uid = String(live.uid);
+            }
+          } catch {}
+        }
+
+        return { cookie, name: name || `账号 ${i + 1}`, proxy, uid };
+      }))).filter(a => a.cookie);
     await setAccounts(clean);
-    res.json({ ok: true, count: clean.length });
+    res.json({ ok: true, count: clean.length, accounts: sanitizeAccountsForResponse(clean) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -144,61 +372,122 @@ app.post('/api/accounts', async (req, res) => {
 
 // ── cookie validator ──────────────────────────────────────
 app.post('/api/validate-cookie', async (req, res) => {
-  const { cookie } = req.body ?? {};
+  const { cookie, proxy } = req.body ?? {};
   if (!cookie || typeof cookie !== 'string') {
     return res.status(400).json({ ok: false, error: '缺少 cookie' });
   }
   const cookieStr = cookie.trim();
+  const proxyStr = typeof proxy === 'string' ? proxy.trim() : '';
 
   // 1. Check required tokens are present
-  const required = ['SUB', 'XSRF-TOKEN'];
-  const recommended = ['SUBP', 'SCF'];
-  const missing = required.filter(k => !new RegExp(`(?:^|;\\s*)${k}=`).test(cookieStr));
-  const missingRec = recommended.filter(k => !new RegExp(`(?:^|;\\s*)${k}=`).test(cookieStr));
+  const { missing, missingRec } = checkCookieFields(cookieStr);
 
   if (missing.length) {
     return res.json({ ok: false, valid: false, error: `缺少必要字段: ${missing.join(', ')}`, missing, missingRec });
   }
 
-  // 2. Live check — fetch current user's mymblog (no uid needed, requires auth)
-  const xsrf = (cookieStr.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/) ?? [])[1] ?? '';
-  const commonHeaders = {
-    'Cookie': cookieStr,
-    'x-xsrf-token': xsrf,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://weibo.com',
-    'x-requested-with': 'XMLHttpRequest',
-    'Accept': 'application/json, text/plain, */*',
-  };
-  const tryFetch = async (url) => {
-    const resp = await fetch(url, { headers: commonHeaders });
-    const text = await resp.text();
-    try { return JSON.parse(text); } catch { return null; }
-  };
+  // 2. Live check — fetch current user's profile with the provided cookie
   try {
-    // Primary: mymblog returns ok=1 when authenticated; user info in first post
-    let data = await tryFetch('https://weibo.com/ajax/statuses/mymblog?page=1&feature=0');
-    if (data?.ok === 1) {
-      const user = data?.data?.list?.[0]?.user ?? null;
-      return res.json({ ok: true, valid: true, missingRec,
-        uid: user?.id ?? null,
-        name: user?.screen_name ?? '已验证',
-        avatar: user?.profile_image_url ?? null });
+    const live = await validateCookieLive(cookieStr, proxyStr);
+    if (live.valid) {
+      return res.json({ ok: true, valid: true, missingRec, uid: live.uid, name: live.name, avatar: live.avatar });
     }
-    // Fallback: profile/info with uid extracted from SUB cookie
-    const subMatch = cookieStr.match(/(?:^|;\s*)SUB=([^;]+)/);
-    if (subMatch) {
-      // try profile info with no uid — Weibo sometimes returns current user
-      data = await tryFetch('https://weibo.com/ajax/profile/info');
-      const user = data?.data?.user;
-      if (user) {
-        return res.json({ ok: true, valid: true, missingRec, uid: user.id, name: user.screen_name, avatar: user.profile_image_url });
-      }
-    }
-    const reason = data ? 'Cookie 无效或已过期' : '服务器返回非 JSON 响应';
-    return res.json({ ok: false, valid: false, error: reason, missingRec });
+    return res.json({ ok: false, valid: false, error: live.reason, missingRec });
   } catch (e) {
-    return res.json({ ok: false, valid: false, error: `网络请求失败: ${e.message}`, missingRec });
+    const classified = classifyBackendError(e);
+    return res.json({
+      ok: false,
+      valid: false,
+      error: `${classified.reason}: ${classified.detail}`,
+      errorType: classified.type,
+      missingRec,
+    });
+  }
+});
+
+app.post('/api/accounts/:index/reset-browser', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+    const result = await resetBrowserProfile({ accountIndex: idx, accountName: accounts[idx]?.name ?? '' });
+    if (result.error) {
+      return res.status(500).json({ ok: false, error: result.error });
+    }
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+  if (refreshLocks.has(idx)) {
+    return res.status(409).json({ ok: false, error: '该账号正在刷新 Cookie，请稍候重试' });
+  }
+
+  refreshLocks.add(idx);
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    const maxWaitMs = Math.min(10 * 60 * 1000, Math.max(30 * 1000, Number.parseInt(req.body?.maxWaitMs ?? 180000, 10) || 180000));
+    const refreshed = await refreshCookieViaManualLogin({
+      accountIndex: idx,
+      accountName: accounts[idx]?.name ?? '',
+      proxy: accounts[idx]?.proxy ?? '',
+      maxWaitMs,
+    });
+
+    const check = checkCookieFields(refreshed.cookie);
+    if (check.missing.length) {
+      return res.status(400).json({ ok: false, error: `刷新完成但 Cookie 缺少字段: ${check.missing.join(', ')}`, missing: check.missing });
+    }
+
+    let live = { valid: false, uid: null, name: null, avatar: null, reason: '未校验' };
+    try {
+      live = await validateCookieLive(refreshed.cookie, accounts[idx]?.proxy ?? '');
+    } catch (e) {
+      live = { valid: false, uid: null, name: null, avatar: null, reason: `刷新后校验失败: ${e.message}` };
+    }
+
+    const updated = accounts.map((a, i) => (i === idx ? {
+      ...a,
+      cookie: refreshed.cookie,
+      uid: live.valid && live.uid ? String(live.uid) : String(a.uid ?? '').trim(),
+    } : a));
+    await setAccounts(updated);
+    const clean = sanitizeAccountsForResponse(updated);
+
+    return res.json({
+      ok: true,
+      index: idx,
+      account: clean[idx],
+      validated: {
+        valid: !!live.valid,
+        uid: live.uid,
+        name: live.name,
+        avatar: live.avatar,
+        error: live.valid ? null : live.reason,
+        missingRec: check.missingRec,
+      },
+      message: 'Cookie 已刷新并保存',
+    });
+  } catch (e) {
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  } finally {
+    refreshLocks.delete(idx);
   }
 });
 
@@ -217,24 +506,110 @@ app.post('/api/quick-repost', wrap(async (client, req) => {
 }));
 
 app.post('/api/repost-tweet', wrap(async (client, req) => {
-  const { mid, content } = req.body;
-  return client.repostTweet({ mid: resolveMid(mid), content });
+  const { mid, content, visible, listId } = req.body;
+  return client.repostTweet({ mid: resolveMid(mid), content, visible, listId });
 }));
 
 // ── comments ──────────────────────────────────────────────
 app.post('/api/comment-tweet', wrap(async (client, req) => {
   const { mid, content } = req.body;
-  return client.commentTweet({ mid: resolveMid(mid), content });
+  const resolvedMid = resolveMid(mid);
+  const result = await client.commentTweet({ mid: resolvedMid, content });
+  return enrichCommentResult(client, resolvedMid, result);
 }));
 
 app.post('/api/reply-comment', wrap(async (client, req) => {
   const { mid, cid, content } = req.body;
-  return client.replyComment({ mid: resolveMid(mid), cid, content });
+  const resolvedMid = resolveMid(mid);
+  const result = await client.replyComment({ mid: resolvedMid, cid, content });
+  return enrichCommentResult(client, resolvedMid, result);
 }));
 
 app.post('/api/delete-comment', wrap(async (client, req) => {
   return client.deleteComment({ cid: req.body.cid });
 }));
+
+app.post('/api/like-comment', wrap(async (client, req) => {
+  return client.likeComment(resolveCommentLikeTarget(req.body.cid));
+}));
+
+app.post('/api/batch-like-comment', wrap(async (client, req) => {
+  const cidList = String(req.body.cids ?? '').split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  if (!cidList.length) throw new Error('cids 不能为空');
+  const results = [];
+  for (const cid of cidList) {
+    try {
+      const result = await client.likeComment(resolveCommentLikeTarget(cid));
+      results.push({ cid, ...result });
+    } catch (e) {
+      results.push({ cid, ok: 0, error: e.message });
+    }
+  }
+  return { ok: true, results };
+}));
+
+app.post('/api/batch-like-comment-stream', async (req, res) => {
+  try {
+    const cidList = String(req.body.cids ?? '').split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+    if (!cidList.length) return res.status(400).json({ ok: false, error: 'cids 不能为空' });
+    
+    const accountDelay = Math.max(0, parseInt(req.body.delay ?? 0));
+    const cidDelay = Math.max(0, parseInt(req.body.cidDelay ?? 0));
+    
+    const accounts = await getAccounts();
+    const selectedAccounts = Array.isArray(req.body.selectedAccounts) && req.body.selectedAccounts.length
+      ? req.body.selectedAccounts.filter(i => i >= 0 && i < accounts.length)
+      : Array.from({ length: accounts.length }, (_, i) => i);
+    
+    const total = cidList.length * selectedAccounts.length;
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    
+    const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+    
+    send({ type: 'start', total, cidCount: cidList.length, accountCount: selectedAccounts.length });
+    
+    let step = 0;
+    for (let cidIdx = 0; cidIdx < cidList.length; cidIdx++) {
+      const cid = cidList[cidIdx];
+      for (let accIdx = 0; accIdx < selectedAccounts.length; accIdx++) {
+        const accountIdx = selectedAccounts[accIdx];
+        try {
+          const acc = accounts[accountIdx];
+          const client = createClient(acc.cookie, null, acc.proxy || null);
+          const result = await client.likeComment(resolveCommentLikeTarget(cid));
+          step++;
+          send({ type: 'done', step, total, cid, accountIdx, result });
+          
+          // Account delay after each account (except last account)
+          if (accIdx < selectedAccounts.length - 1 && accountDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, accountDelay));
+          }
+        } catch (e) {
+          step++;
+          send({ type: 'error', step, total, cid, accountIdx, error: e.message });
+          
+          if (accIdx < selectedAccounts.length - 1 && accountDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, accountDelay));
+          }
+        }
+      }
+      
+      // Delay after each CID (except last CID)
+      if (cidIdx < cidList.length - 1 && cidDelay > 0) {
+        await new Promise(resolve => setTimeout(resolve, cidDelay));
+      }
+    }
+    
+    send({ type: 'complete', total });
+    res.end();
+  } catch (e) {
+    res.write(`data: ${JSON.stringify({ type: 'fatal', error: e.message })}\n\n`);
+    res.end();
+  }
+});
 
 // ── social ────────────────────────────────────────────────
 app.post('/api/follow-user', wrap(async (client, req) => {
@@ -275,6 +650,43 @@ app.get('/api/groups', wrap(async (client) => {
   return client.fetchGroups();
 }));
 
+// ── inbox / notifications ─────────────────────────────────
+app.get('/api/inbox/unread-counts', wrap(async (client) => {
+  return client.fetchUnreadCounts();
+}));
+
+app.get('/api/inbox/likes', wrap(async (client, req) => {
+  return client.fetchLikeNotices({ sinceId: req.query.sinceId });
+}));
+
+app.get('/api/inbox/at-me-tweets', wrap(async (client, req) => {
+  return client.fetchAtMeTweets({ sinceId: req.query.sinceId });
+}));
+
+app.get('/api/inbox/at-me-comments', wrap(async (client, req) => {
+  return client.fetchAtMeComments({ sinceId: req.query.sinceId });
+}));
+
+app.get('/api/inbox/comments', wrap(async (client, req) => {
+  return client.fetchCommentNotices({ sinceId: req.query.sinceId });
+}));
+
+app.get('/api/inbox/dm-list', wrap(async (client, req) => {
+  return client.fetchDmList({ page: req.query.page ? Number(req.query.page) : 1 });
+}));
+
+app.get('/api/inbox/dm-chat', wrap(async (client, req) => {
+  if (!req.query.uid) return { error: 'uid is required' };
+  return client.fetchDmChat({ uid: req.query.uid, sinceId: req.query.sinceId });
+}));
+
+app.post('/api/inbox/dm-send', wrap(async (client, req) => {
+  const { uid, content } = req.body ?? {};
+  if (!uid) throw new Error('uid is required');
+  if (!content || !String(content).trim()) throw new Error('content is required');
+  return client.sendDm({ uid, content });
+}));
+
 // ── copywriting ──────────────────────────────────────────
 app.get('/api/copywriting', async (req, res) => {
   try {
@@ -307,13 +719,25 @@ app.post('/api/upload-picture', upload.single('image'), wrap(async (client, req)
 
 // ── batch ─────────────────────────────────────────────────
 const batchHandlers = {
-  '/api/post-tweet':        (c, b) => c.postTweet({ content: b.content, pid: b.pid, mid: b.mid, videoTitle: b.videoTitle, videoType: b.videoType }),
+  '/api/post-tweet':        (c, b) => {
+    if (!b.content || !String(b.content).trim()) throw new Error('content 不能为空');
+    return c.postTweet({ content: b.content, pid: b.pid, mid: b.mid, videoTitle: b.videoTitle, videoType: b.videoType });
+  },
   '/api/delete-tweet':      (c, b) => c.deleteTweet({ mid: resolveMid(b.mid) }),
   '/api/quick-repost':      (c, b) => c.quickRepost({ mid: resolveMid(b.mid) }),
-  '/api/repost-tweet':      (c, b) => c.repostTweet({ mid: resolveMid(b.mid), content: b.content }),
-  '/api/comment-tweet':     (c, b) => c.commentTweet({ mid: resolveMid(b.mid), content: b.content }),
-  '/api/reply-comment':     (c, b) => c.replyComment({ mid: resolveMid(b.mid), cid: b.cid, content: b.content }),
+  '/api/repost-tweet':      (c, b) => c.repostTweet({ mid: resolveMid(b.mid), content: b.content, visible: b.visible, listId: b.listId }),
+  '/api/comment-tweet':     async (c, b) => {
+    const mid = resolveMid(b.mid);
+    const result = await c.commentTweet({ mid, content: b.content });
+    return enrichCommentResult(c, mid, result);
+  },
+  '/api/reply-comment':     async (c, b) => {
+    const mid = resolveMid(b.mid);
+    const result = await c.replyComment({ mid, cid: b.cid, content: b.content });
+    return enrichCommentResult(c, mid, result);
+  },
   '/api/delete-comment':    (c, b) => c.deleteComment({ cid: b.cid }),
+  '/api/like-comment':      (c, b) => c.likeComment(resolveCommentLikeTarget(b.cid)),
   '/api/follow-user':       (c, b) => c.followUser({ uid: b.uid }),
   '/api/unfollow-user':     (c, b) => c.unfollowUser({ uid: b.uid }),
   '/api/like-tweet':        (c, b) => c.likeTweet({ mid: resolveMid(b.mid) }),
@@ -321,9 +745,11 @@ const batchHandlers = {
   '/api/follow-super-topic':(c, b) => c.followSuperTopic({ topicId: b.topicId, name: b.name }),
 };
 
+const loopableBatchEndpoints = new Set(['/api/quick-repost', '/api/repost-tweet']);
+
 // SSE streaming batch — sends one event per account as it completes
 app.post('/api/batch-stream', async (req, res) => {
-  const { endpoint, body: params = {}, delay = 3000, loops = 1, roundDelay = 0, selectedAccounts } = req.body;
+  const { endpoint, body: params = {}, delay = 3000, selectedAccounts, loops = 1, roundDelay = 0 } = req.body;
   const handler = batchHandlers[endpoint];
   if (!handler) {
     res.status(400).json({ ok: false, error: `Batch not supported for: ${endpoint}` });
@@ -336,7 +762,9 @@ app.post('/api/batch-stream', async (req, res) => {
     ? selectedAccounts.filter(i => i >= 0 && i < accounts.length)
     : Array.from({ length: accounts.length }, (_, i) => i);
   const accountCount = indices.length;
-  const totalRounds = Math.max(1, Math.floor(loops));
+  const totalRounds = loopableBatchEndpoints.has(endpoint) ? Math.max(1, Math.floor(Number(loops) || 1)) : 1;
+  const interAccountDelay = Math.max(0, Number(delay) || 0);
+  const interRoundDelay = totalRounds > 1 ? Math.max(0, Number(roundDelay) || 0) : 0;
   const total = accountCount * totalRounds;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -355,7 +783,7 @@ app.post('/api/batch-stream', async (req, res) => {
     return { ...p, [p.randomField]: picked };
   };
 
-  send({ type: 'start', total, totalRounds, accountCount });
+  send({ type: 'start', total, accountCount, totalRounds });
 
   const waitMs = async (ms, label) => {
     let remaining = ms;
@@ -367,28 +795,29 @@ app.post('/api/batch-stream', async (req, res) => {
     }
   };
 
+  let stepNum = 0;
   for (let loop = 0; loop < totalRounds; loop++) {
-    if (loop > 0 && roundDelay > 0) {
-      await waitMs(roundDelay, `第 ${loop + 1} 轮开始前等待`);
+    if (loop > 0 && interRoundDelay > 0) {
+      await waitMs(interRoundDelay, `第 ${loop + 1} 轮开始前等待`);
     }
     for (let pos = 0; pos < indices.length; pos++) {
       const i = indices[pos];
-      const stepNum = loop * accountCount + pos + 1;
-      if (pos > 0 && delay > 0) {
-        await waitMs(delay, `账号 ${i + 1} 等待中`);
+      stepNum += 1;
+      if (pos > 0 && interAccountDelay > 0) {
+        await waitMs(interAccountDelay, `账号 ${i + 1} 等待中`);
       }
-      send({ type: 'running', account: i + 1, loop: loop + 1, totalRounds, step: stepNum, total });
+      send({ type: 'running', account: i + 1, step: stepNum, total, loop: loop + 1, totalRounds });
       try {
-        const cookie = accounts[i]?.cookie;
-        if (!cookie) throw new Error(`Account ${i} not found`);
-        const client = createClient(cookie);
+        const acc = accounts[i];
+        if (!acc?.cookie) throw new Error(`Account ${i} not found`);
+        const client = createClient(acc.cookie, null, acc.proxy || null);
         const resolved = resolveParams(params);
         const pickedContent = (params.useRandom && params.randomField) ? (resolved[params.randomField] ?? null) : null;
         const data = await handler(client, resolved);
-        send({ type: 'result', account: i + 1, loop: loop + 1, totalRounds, step: stepNum, total, ok: true, data, pickedContent });
+        send({ type: 'result', account: i + 1, step: stepNum, total, loop: loop + 1, totalRounds, ok: true, data, pickedContent });
       } catch (err) {
-        console.error(`Batch loop ${loop + 1} account ${i + 1}:`, err.message);
-        send({ type: 'result', account: i + 1, loop: loop + 1, totalRounds, step: stepNum, total, ok: false, error: err.message });
+        console.error(`Batch account ${i + 1}:`, err.message);
+        send({ type: 'result', account: i + 1, step: stepNum, total, loop: loop + 1, totalRounds, ok: false, error: err.message });
       }
     }
   }
@@ -397,36 +826,235 @@ app.post('/api/batch-stream', async (req, res) => {
   res.end();
 });
 
+// ── schedules ─────────────────────────────────────────────
+const runningJobs = new Set();
+
+app.get('/api/schedules', async (_req, res) => {
+  try {
+    const jobs = await getSchedules();
+    res.json({ ok: true, jobs });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/schedules', async (req, res) => {
+  try {
+    const {
+      name,
+      endpoint,
+      body = {},
+      delay = 3000,
+      loops = 1,
+      roundDelay = 0,
+      selectedAccounts,
+      scheduledAt,
+      repeatMinutes,
+    } = req.body ?? {};
+
+    if (!batchHandlers[endpoint]) {
+      return res.status(400).json({ ok: false, error: `Batch not supported for: ${endpoint}` });
+    }
+    if (!scheduledAt) {
+      return res.status(400).json({ ok: false, error: 'scheduledAt is required' });
+    }
+
+    const job = await addSchedule({
+      name: String(name ?? '').trim(),
+      endpoint,
+      body,
+      delay: Number(delay) || 0,
+      loops: Math.max(1, Number(loops) || 1),
+      roundDelay: Number(roundDelay) || 0,
+      selectedAccounts: Array.isArray(selectedAccounts) ? selectedAccounts : [],
+      scheduledAt: new Date(scheduledAt).toISOString(),
+      repeatMinutes: repeatMinutes ? Math.max(1, Number(repeatMinutes) || 0) : null,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    });
+    res.json({ ok: true, job });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/schedules/:id', async (req, res) => {
+  try {
+    await deleteSchedule(req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/schedules/:id/run', async (req, res) => {
+  try {
+    const jobs = await getSchedules();
+    const job = jobs.find(item => item.id === req.params.id);
+    if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+    void runScheduleJob(job);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+async function runScheduleJob(job) {
+  if (!job?.id || runningJobs.has(job.id)) return;
+  const handler = batchHandlers[job.endpoint];
+  if (!handler) {
+    await updateSchedule(job.id, {
+      status: 'failed',
+      lastRunAt: new Date().toISOString(),
+      lastResult: `Batch not supported for: ${job.endpoint}`,
+    });
+    return;
+  }
+
+  runningJobs.add(job.id);
+  try {
+    await updateSchedule(job.id, {
+      status: 'running',
+      lastRunAt: new Date().toISOString(),
+      lastResult: null,
+    });
+
+    const accounts = await getAccounts();
+    const indices = Array.isArray(job.selectedAccounts) && job.selectedAccounts.length
+      ? job.selectedAccounts.filter(i => i >= 0 && i < accounts.length)
+      : Array.from({ length: accounts.length }, (_, i) => i);
+
+    if (!indices.length) {
+      throw new Error('No valid accounts selected');
+    }
+
+    const totalRounds = Math.max(1, Math.floor(Number(job.loops) || 1));
+    const delay = Math.max(0, Number(job.delay) || 0);
+    const roundDelay = Math.max(0, Number(job.roundDelay) || 0);
+    const copyGroups = await getCopywritingGroups();
+    const resolveParams = (params) => {
+      if (!params?.useRandom || !params.randomField) return params;
+      const picked = randomItem(copyGroups, params.randomGroup || null);
+      if (!picked) return params;
+      return { ...params, [params.randomField]: picked };
+    };
+
+    const results = [];
+    for (let loop = 0; loop < totalRounds; loop++) {
+      if (loop > 0 && roundDelay > 0) {
+        await new Promise(r => setTimeout(r, roundDelay));
+      }
+      for (let pos = 0; pos < indices.length; pos++) {
+        if (pos > 0 && delay > 0) {
+          await new Promise(r => setTimeout(r, delay));
+        }
+        const accountIndex = indices[pos];
+        const acc = accounts[accountIndex];
+        if (!acc?.cookie) throw new Error(`Account ${accountIndex} not found`);
+        const client = createClient(acc.cookie, null, acc.proxy || null);
+        const payload = resolveParams(job.body ?? {});
+        const data = await handler(client, payload);
+        results.push({ account: accountIndex + 1, loop: loop + 1, ok: true, data });
+      }
+    }
+
+    const patch = {
+      status: 'done',
+      lastRunAt: new Date().toISOString(),
+      lastResult: results,
+    };
+    if (job.repeatMinutes) {
+      patch.status = 'pending';
+      patch.scheduledAt = new Date(Date.now() + Number(job.repeatMinutes) * 60 * 1000).toISOString();
+    }
+    await updateSchedule(job.id, patch);
+  } catch (err) {
+    await updateSchedule(job.id, {
+      status: 'failed',
+      lastRunAt: new Date().toISOString(),
+      lastResult: err.message,
+    });
+  } finally {
+    runningJobs.delete(job.id);
+  }
+}
+
+function startScheduler() {
+  const poll = async () => {
+    try {
+      const jobs = await getSchedules();
+      const now = Date.now();
+      for (const job of jobs) {
+        if (job.status !== 'pending' || !job.scheduledAt) continue;
+        const runAt = new Date(job.scheduledAt).getTime();
+        if (!Number.isFinite(runAt) || runAt > now) continue;
+        void runScheduleJob(job);
+      }
+    } catch (err) {
+      console.error('Scheduler poll failed:', err.message);
+    }
+  };
+
+  void poll();
+  setInterval(() => { void poll(); }, 30_000);
+}
+
+// ── cookie keep-alive ────────────────────────────────────
+const KEEP_ALIVE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 24 * 60 * 60 * 1000; // default: every 24 hours
+const KEEP_ALIVE_FIRST_DELAY_MS = Number(process.env.KEEP_ALIVE_FIRST_DELAY_MS) || 6 * 60 * 60 * 1000; // default: 6h after startup
+
+let keepAliveLog = null; // { ranAt, results: [{accountIndex, accountName, ok, error?}] }
+
+app.get('/api/keep-alive-log', (_req, res) => {
+  res.json({ ok: true, log: keepAliveLog });
+});
+
+function startCookieKeepAlive() {
+  const run = async () => {
+    try {
+      const accounts = await getAccounts();
+      if (!accounts.length) return;
+      const results = await keepAliveAllAccounts(accounts);
+      const updated = accounts.map((a, i) => {
+        const r = results.find(x => x.accountIndex === i);
+        return r?.ok && r.cookie ? { ...a, cookie: r.cookie } : a;
+      });
+      await setAccounts(updated);
+      keepAliveLog = {
+        ranAt: new Date().toISOString(),
+        results: results.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
+      };
+      const ok = results.filter(r => r.ok).length;
+      const fail = results.filter(r => !r.ok && r.error !== 'no_profile').length;
+      if (ok || fail) console.log(`Cookie keep-alive: ${ok} refreshed, ${fail} failed`);
+    } catch (err) {
+      console.error('Cookie keep-alive failed:', err.message);
+    }
+  };
+
+  // Run first time after KEEP_ALIVE_FIRST_DELAY_MS (default 6h), then every KEEP_ALIVE_INTERVAL_MS (default 24h).
+  console.log(`Cookie keep-alive: first run in ${Math.round(KEEP_ALIVE_FIRST_DELAY_MS / 3_600_000 * 10) / 10}h, then every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 3_600_000 * 10) / 10}h`);
+  setTimeout(() => { void run(); }, KEEP_ALIVE_FIRST_DELAY_MS);
+  setInterval(() => { void run(); }, KEEP_ALIVE_INTERVAL_MS);
+}
+
 // ── start ─────────────────────────────────────────────────
-import { execSync } from 'child_process';
-
-const PORT = 3001;
-
 async function start() {
-  const server = app.listen(PORT, () => console.log(`Weibo backend running on http://localhost:${PORT}`));
+  const server = app.listen(PORT, () => {
+    console.log(`Weibo backend running on http://localhost:${PORT}`);
+    startScheduler();
+    // Keep-alive disabled — use the 刷新Cookie button manually to avoid proxy traffic.
+    // startCookieKeepAlive();
+  });
 
   server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.log(`Port ${PORT} in use — killing conflicting process…`);
-    try {
-      const result = execSync(`netstat -ano | findstr :${PORT}`, { encoding: 'utf-8' });
-      const pids = [...new Set(
-        result.split('\n')
-          .filter(l => l.includes('LISTENING'))
-          .map(l => l.trim().split(/\s+/).pop())
-          .filter(p => p && p !== '0')
-      )];
-      for (const p of pids) {
-        try { execSync(`taskkill /F /PID ${p}`); console.log(`Killed PID ${p}`); } catch {}
-      }
-    } catch {}
-    setTimeout(() => {
-      server.close();
-      app.listen(PORT, () => console.log(`Weibo backend running on http://localhost:${PORT}`));
-    }, 500);
-  } else {
-    console.error(err);
-  }
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Stop the conflicting process or set PORT to a different value.`);
+      process.exit(1);
+    } else {
+      console.error(err);
+      process.exit(1);
+    }
   });
 }
 
