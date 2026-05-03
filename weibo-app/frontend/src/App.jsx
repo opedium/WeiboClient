@@ -9,6 +9,151 @@ const API = (() => {
 })();
 
 function getToken() { return localStorage.getItem('auth_token') || ''; }
+function setToken(token) { localStorage.setItem('auth_token', token); }
+function clearToken() { localStorage.removeItem('auth_token'); }
+
+function AuthGate({ children }) {
+  const [booting, setBooting] = useState(true);
+  const [authRequired, setAuthRequired] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const healthRes = await fetch(`${API}/api/health`);
+        const health = await healthRes.json().catch(() => ({}));
+        const required = health?.authRequired !== false;
+        if (cancelled) return;
+
+        setAuthRequired(required);
+        if (!required) {
+          setAuthenticated(true);
+          return;
+        }
+
+        const token = getToken();
+        if (!token) {
+          setAuthenticated(false);
+          return;
+        }
+
+        const meRes = await fetch(`${API}/api/me`, {
+          headers: { 'x-auth-token': token },
+        });
+        const me = await meRes.json().catch(() => ({}));
+        if (cancelled) return;
+
+        const ok = Boolean(me?.authenticated);
+        setAuthenticated(ok);
+        if (!ok) clearToken();
+      } catch {
+        if (!cancelled) {
+          setAuthRequired(true);
+          setAuthenticated(Boolean(getToken()));
+        }
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, []);
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    const input = password.trim();
+    if (!input) {
+      setError('请输入密码');
+      return;
+    }
+
+    setSubmitting(true);
+    setError('');
+    try {
+      const res = await fetch(`${API}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: input }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        setError(data?.error || '登录失败，请检查密码');
+        return;
+      }
+
+      setToken(data?.token || input);
+      setAuthenticated(true);
+      setPassword('');
+    } catch {
+      setError('网络错误，无法连接服务器');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (booting) {
+    return (
+      <main className="main" style={{ margin: '4rem auto', maxWidth: 520 }}>
+        <div className="result success">
+          <span className="tag ok">✓</span>
+          正在检查登录状态...
+        </div>
+      </main>
+    );
+  }
+
+  if (!authRequired || authenticated) {
+    return (
+      <>
+        {authRequired && (
+          <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 1000 }}>
+            <button
+              className="btn-secondary"
+              onClick={() => {
+                clearToken();
+                setAuthenticated(false);
+              }}
+            >
+              退出登录
+            </button>
+          </div>
+        )}
+        {children}
+      </>
+    );
+  }
+
+  return (
+    <main className="main" style={{ margin: '4rem auto', maxWidth: 520 }}>
+      <div className="op-card" style={{ maxWidth: 520 }}>
+        <h2 style={{ marginTop: 0 }}>请输入访问密码</h2>
+        <p style={{ marginTop: 6, opacity: 0.8 }}>登录后才可使用所有功能。</p>
+        <form onSubmit={onSubmit} style={{ display: 'grid', gap: 10, marginTop: 12 }}>
+          <input
+            type="password"
+            placeholder="输入密码"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+          />
+          <button className="btn-submit" type="submit" disabled={submitting}>
+            {submitting ? '登录中...' : '登录'}
+          </button>
+        </form>
+        {error && (
+          <div className="result error" style={{ marginTop: 12 }}>
+            <span className="tag err">✗</span>
+            {error}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
 
 function formatJsonForDisplay(value) {
   if (typeof value === 'string') {
@@ -1747,7 +1892,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   );
 }
 
-export default function App() {
+function AppShell() {
   const [selected, setSelected] = useState(OPERATIONS[0]);
   const [showCopywriting, setShowCopywriting] = useState(false);
   const [showAccounts, setShowAccounts] = useState(false);
@@ -1846,5 +1991,13 @@ export default function App() {
         }
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthGate>
+      <AppShell />
+    </AuthGate>
   );
 }
