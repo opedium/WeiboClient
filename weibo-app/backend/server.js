@@ -3,11 +3,12 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import axios from 'axios';
+import { timingSafeEqual } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { createClient, bidToMid } from './weibo.js';
-import { refreshCookieViaManualLogin, keepAliveAllAccounts, resetBrowserProfile } from './cookieRefresh.js';
+import { refreshCookieViaManualLogin, keepAliveAllAccounts, resetBrowserProfile, checkPlaywrightRuntime } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
 
@@ -15,10 +16,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3001);
 const JSON_LIMIT = process.env.JSON_LIMIT ?? '256kb';
 const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024);
-const CORS_ORIGINS = (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://127.0.0.1:3000')
+const CORS_ORIGINS = (process.env.CORS_ORIGINS ?? '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+const CORS_ALLOW_ALL = CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes('*');
+
+const AUTH_TOKEN = String(process.env.AUTH_TOKEN ?? '').trim();
+const AUTH_REQUIRED = String(process.env.AUTH_REQUIRED ?? (AUTH_TOKEN ? 'true' : 'false')).toLowerCase() === 'true';
+const PUBLIC_ROUTES = new Set(['/api/login', '/api/logout', '/api/me', '/api/health']);
+
+function safeTokenEqual(a, b) {
+  const aa = Buffer.from(String(a ?? ''), 'utf8');
+  const bb = Buffer.from(String(b ?? ''), 'utf8');
+  if (aa.length === 0 || aa.length !== bb.length) return false;
+  return timingSafeEqual(aa, bb);
+}
 
 function randomItem(groups, groupName) {
   if (!groups || !groups.length) return null;
@@ -38,12 +51,25 @@ const upload = multer({
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
+    if (CORS_ALLOW_ALL) return callback(null, true);
     if (CORS_ORIGINS.includes(origin)) return callback(null, true);
     return callback(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
 }));
 app.use(express.json({ limit: JSON_LIMIT }));
+
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+  if (PUBLIC_ROUTES.has(req.path)) return next();
+  if (!AUTH_REQUIRED) return next();
+  if (!AUTH_TOKEN) {
+    return res.status(500).json({ ok: false, error: 'AUTH_REQUIRED=true but AUTH_TOKEN is empty' });
+  }
+  const token = req.headers['x-auth-token'];
+  if (safeTokenEqual(token, AUTH_TOKEN)) return next();
+  return res.status(401).json({ ok: false, error: '未授权，请先登录' });
+});
 
 function maskCookie(cookie) {
   const s = String(cookie ?? '').trim();
@@ -979,6 +1005,41 @@ async function runScheduleJob(job) {
   }
 }
 
+// ── auth ──────────────────────────────────────────────────
+app.post('/api/login', (req, res) => {
+  if (!AUTH_REQUIRED) {
+    return res.json({ ok: true, token: '', mode: 'auth_disabled' });
+  }
+  if (!AUTH_TOKEN) {
+    return res.status(500).json({ ok: false, error: '服务端未配置 AUTH_TOKEN' });
+  }
+  const provided = String(req.body?.token ?? '').trim();
+  if (!safeTokenEqual(provided, AUTH_TOKEN)) {
+    return res.status(401).json({ ok: false, error: '登录失败：Token 不正确' });
+  }
+  return res.json({ ok: true, token: AUTH_TOKEN });
+});
+
+app.post('/api/logout', (_req, res) => {
+  return res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  if (!AUTH_REQUIRED) {
+    return res.json({ ok: true, authenticated: true, mode: 'auth_disabled' });
+  }
+  const token = req.headers['x-auth-token'];
+  return res.json({ ok: true, authenticated: safeTokenEqual(token, AUTH_TOKEN), mode: 'token' });
+});
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    authRequired: AUTH_REQUIRED,
+    corsMode: CORS_ALLOW_ALL ? 'allow_all' : 'allow_list',
+  });
+});
+
 function startScheduler() {
   const poll = async () => {
     try {
@@ -1040,6 +1101,22 @@ function startCookieKeepAlive() {
 
 // ── start ─────────────────────────────────────────────────
 async function start() {
+  if (AUTH_REQUIRED && !AUTH_TOKEN) {
+    throw new Error('AUTH_REQUIRED=true but AUTH_TOKEN is empty. Refusing to start.');
+  }
+  if (!AUTH_REQUIRED) {
+    console.warn('[security] Auth middleware is disabled (AUTH_REQUIRED=false).');
+  }
+  if (CORS_ALLOW_ALL) {
+    console.warn('[security] CORS is set to allow all origins. Set CORS_ORIGINS in production.');
+  }
+
+  const playwright = await checkPlaywrightRuntime();
+  if (!playwright.ok) {
+    console.warn(`[cookieRefresh] Playwright runtime check failed: ${playwright.error}`);
+    console.warn('[cookieRefresh] On Ubuntu, run: npx playwright install ; npx playwright install-deps');
+  }
+
   const server = app.listen(PORT, () => {
     console.log(`Weibo backend running on http://localhost:${PORT}`);
     startScheduler();

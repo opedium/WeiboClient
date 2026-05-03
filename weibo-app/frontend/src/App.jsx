@@ -1,7 +1,12 @@
 import { useState, useEffect, useCallback, Component } from 'react';
 import { OPERATIONS, GROUPS, RANDOM_SUPPORTED_OPS, BATCH_SUPPORTED_ENDPOINTS, SCHEDULABLE_OPERATIONS } from './config.js';
 
-const API = import.meta.env.VITE_API_URL ?? 'https://69f23082000a285e26a7.69f221090023490a8740.sgp.appwrite.run';
+const API = (() => {
+  const raw = String(import.meta.env.VITE_API_URL ?? '').trim().replace(/\/+$/, '');
+  if (raw) return raw;
+  // In production, empty API means same-origin (via reverse proxy). In dev keep localhost backend default.
+  return import.meta.env.DEV ? 'http://localhost:3001' : '';
+})();
 
 function getToken() { return localStorage.getItem('auth_token') || ''; }
 

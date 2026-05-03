@@ -7,6 +7,18 @@ import { chromium } from 'playwright';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, '.auth-profiles');
 
+export async function checkPlaywrightRuntime() {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    await browser.close();
+    return { ok: true };
+  } catch (error) {
+    try { if (browser) await browser.close(); } catch {}
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
 function hasCookieField(cookieStr, key) {
   return new RegExp(`(?:^|;\\s*)${key}=`).test(cookieStr);
 }
