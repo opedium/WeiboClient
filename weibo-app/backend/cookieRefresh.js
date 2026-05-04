@@ -2,10 +2,230 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { chromium } from 'playwright';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, '.auth-profiles');
+const COOKIE_REFRESH_MODE = String(process.env.COOKIE_REFRESH_MODE ?? 'auto').trim().toLowerCase();
+const QR_LOGIN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.QR_LOGIN_TTL_MS ?? '180000', 10) || 180_000);
+const qrSessions = new Map();
+
+function canOpenVisibleBrowser() {
+  if (COOKIE_REFRESH_MODE === 'headless') return false;
+  if (COOKIE_REFRESH_MODE === 'manual') return true;
+  if (process.platform === 'win32' || process.platform === 'darwin') return true;
+  return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+function explainHeadfulNotAvailable(reason = '当前环境不支持可视化浏览器') {
+  return `${reason}。此服务器将仅尝试无头刷新；若 Cookie 已过期，请在本地桌面环境完成刷新后再保存到服务器。`;
+}
+
+function getQrSession(sessionId) {
+  const session = qrSessions.get(sessionId);
+  if (!session) return null;
+  const terminal = ['success', 'failed', 'cancelled', 'expired'];
+  if (terminal.includes(session.status)) {
+    const terminalAt = session.completedAt ? Date.parse(session.completedAt) : session.createdAt;
+    if (Number.isFinite(terminalAt) && Date.now() - terminalAt > 5 * 60 * 1000) {
+      qrSessions.delete(sessionId);
+      return null;
+    }
+  }
+  if (Date.now() > session.expiresAt && !['success', 'failed', 'cancelled', 'expired'].includes(session.status)) {
+    session.status = 'expired';
+    session.error = '二维码已过期，请重新获取';
+    session.completedAt = new Date().toISOString();
+    void closeQrSessionContext(sessionId);
+  }
+  return session;
+}
+
+async function closeQrSessionContext(sessionId) {
+  const session = qrSessions.get(sessionId);
+  if (!session) return;
+  if (session.context) {
+    try { await session.context.close(); } catch {}
+    session.context = null;
+  }
+}
+
+async function readQrImageDataUrl(context, page) {
+  const selectors = [
+    'img[node-type="qrcode_img"]',
+    'img.qrcode_img',
+    'img[src*="qrcode"]',
+    'img[src*="qr"]',
+  ];
+
+  let src = '';
+  for (const sel of selectors) {
+    try {
+      await page.waitForSelector(sel, { timeout: 9000 });
+      src = await page.$eval(sel, node => String(node.getAttribute('src') ?? '').trim());
+      if (src) break;
+    } catch {
+      // Try next selector.
+    }
+  }
+
+  if (!src) {
+    throw new Error('未找到微博登录二维码');
+  }
+
+  if (src.startsWith('data:image/')) {
+    return src;
+  }
+
+  const abs = new URL(src, page.url()).toString();
+  const resp = await context.request.get(abs, {
+    timeout: 20_000,
+    failOnStatusCode: false,
+    headers: {
+      Referer: page.url(),
+      Origin: 'https://passport.weibo.com',
+      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    },
+  });
+  const body = await resp.body();
+  const ct = resp.headers()['content-type'] || 'image/png';
+  return `data:${ct};base64,${body.toString('base64')}`;
+}
+
+async function monitorQrSession(sessionId) {
+  const session = qrSessions.get(sessionId);
+  if (!session) return;
+  const { context } = session;
+
+  try {
+    while (true) {
+      const s = qrSessions.get(sessionId);
+      if (!s) return;
+      if (s.status === 'cancelled') return;
+      if (Date.now() > s.expiresAt) {
+        s.status = 'expired';
+        s.error = '二维码已过期，请重新获取';
+        s.completedAt = new Date().toISOString();
+        await closeQrSessionContext(sessionId);
+        return;
+      }
+
+      const cookies = await context.cookies([
+        'https://weibo.com',
+        'https://www.weibo.com',
+        'https://login.sina.com.cn',
+        'https://passport.weibo.com',
+      ]);
+      const cookieStr = toCookieString(cookies);
+      if (hasRequiredSessionCookies(cookieStr)) {
+        s.status = 'success';
+        s.cookie = cookieStr;
+        s.completedAt = new Date().toISOString();
+        await closeQrSessionContext(sessionId);
+        return;
+      }
+
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (error) {
+    const s = qrSessions.get(sessionId);
+    if (!s) return;
+    s.status = 'failed';
+    s.error = String(error?.message ?? error);
+    s.completedAt = new Date().toISOString();
+    await closeQrSessionContext(sessionId);
+  }
+}
+
+export async function startQrLoginSession({ accountIndex, accountName = '', proxy = '', maxWaitMs = QR_LOGIN_TTL_MS }) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  const userDataDir = profileDirForAccount(accountIndex, accountName);
+  fs.mkdirSync(userDataDir, { recursive: true });
+
+  const proxyConfig = parsePlaywrightProxy(proxy);
+  const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless: true,
+    proxy: proxyConfig || undefined,
+  });
+
+  try {
+    await context.clearCookies();
+    const page = context.pages()[0] ?? await context.newPage();
+    await gotoWithRetry(
+      page,
+      'https://passport.weibo.com/sso/signin?entry=weibo&r=https%3A%2F%2Fweibo.com%2F',
+      { timeoutMs: navTimeoutMs, attempts: 2 }
+    );
+
+    const qrDataUrl = await readQrImageDataUrl(context, page);
+    const sessionId = randomUUID();
+    const ttlMs = Math.max(60_000, Math.min(10 * 60 * 1000, Number.parseInt(maxWaitMs, 10) || QR_LOGIN_TTL_MS));
+    const now = Date.now();
+    const session = {
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      createdAt: now,
+      expiresAt: now + ttlMs,
+      qrDataUrl,
+      context,
+      cookie: '',
+      error: null,
+      completedAt: null,
+    };
+
+    qrSessions.set(sessionId, session);
+    void monitorQrSession(sessionId);
+
+    return {
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      qrDataUrl,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+    };
+  } catch (error) {
+    try { await context.close(); } catch {}
+    throw error;
+  }
+}
+
+export function getQrLoginStatus(sessionId) {
+  const session = getQrSession(sessionId);
+  if (!session) {
+    return { found: false, status: 'not_found', error: '会话不存在或已结束' };
+  }
+
+  return {
+    found: true,
+    sessionId,
+    accountIndex: session.accountIndex,
+    accountName: session.accountName,
+    status: session.status,
+    error: session.error,
+    qrDataUrl: session.qrDataUrl,
+    expiresAt: new Date(session.expiresAt).toISOString(),
+    completedAt: session.completedAt,
+    cookie: session.status === 'success' ? session.cookie : '',
+  };
+}
+
+export async function cancelQrLoginSession(sessionId) {
+  const session = qrSessions.get(sessionId);
+  if (!session) {
+    return { ok: false, status: 'not_found' };
+  }
+  session.status = 'cancelled';
+  session.error = '已取消';
+  session.completedAt = new Date().toISOString();
+  await closeQrSessionContext(sessionId);
+  qrSessions.delete(sessionId);
+  return { ok: true, status: 'cancelled' };
+}
 
 export async function checkPlaywrightRuntime() {
   let browser;
@@ -44,15 +264,31 @@ function profileDirForAccount(accountIndex, accountName) {
 }
 
 function toCookieString(cookies) {
-  // Deduplicate by name to avoid cross-domain duplicates (e.g. XSRF-TOKEN)
-  const seen = new Set();
-  return cookies
-    .filter(c => c?.name && typeof c.value === 'string')
-    .filter(c => {
-      if (seen.has(c.name)) return false;
-      seen.add(c.name);
-      return true;
-    })
+  // Prefer values that belong to weibo domains when duplicate names exist.
+  const scoreDomain = (domainRaw) => {
+    const d = String(domainRaw ?? '').toLowerCase();
+    if (d === 'weibo.com' || d === '.weibo.com' || d.endsWith('.weibo.com')) return 3;
+    if (d === 'www.weibo.com') return 2;
+    if (d === 'sina.com.cn' || d === '.sina.com.cn' || d.endsWith('.sina.com.cn')) return 1;
+    return 0;
+  };
+
+  const selected = new Map();
+  for (const c of cookies ?? []) {
+    if (!c?.name || typeof c.value !== 'string') continue;
+    const prev = selected.get(c.name);
+    if (!prev) {
+      selected.set(c.name, c);
+      continue;
+    }
+    const nextScore = scoreDomain(c.domain);
+    const prevScore = scoreDomain(prev.domain);
+    if (nextScore > prevScore) {
+      selected.set(c.name, c);
+    }
+  }
+
+  return Array.from(selected.values())
     .map(c => `${c.name}=${c.value}`)
     .join('; ');
 }
@@ -352,10 +588,11 @@ export async function keepAliveAllAccounts(accounts) {
  * - If the account profile already has a saved session, tries a headless refresh first.
  * - Falls back to a visible browser only when no session exists or the session has expired.
  */
-export async function refreshCookieViaManualLogin({ accountIndex, accountName = '', proxy = '', maxWaitMs = 180000 }) {
+export async function refreshCookieViaManualLogin({ accountIndex, accountName = '', proxy = '', maxWaitMs = 180000, allowVisibleBrowser = false }) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const userDataDir = profileDirForAccount(accountIndex, accountName);
   fs.mkdirSync(userDataDir, { recursive: true });
+  const headfulAllowed = allowVisibleBrowser && canOpenVisibleBrowser();
 
   return withProfileLock(userDataDir, async () => {
     if (profileHasSession(userDataDir)) {
@@ -363,16 +600,23 @@ export async function refreshCookieViaManualLogin({ accountIndex, accountName = 
       try {
         return await refreshCookieHeadless({ userDataDir, proxy });
       } catch (e) {
-        if (e.message === 'SESSION_EXPIRED' || isNavigationTimeoutError(e)) {
+        if (e.message === 'SESSION_EXPIRED') {
+          if (!headfulAllowed) {
+            throw new Error(explainHeadfulNotAvailable('Cookie 已过期，且无法打开可视化浏览器进行手动登录'));
+          }
           console.log(`[cookieRefresh] account-${accountIndex + 1} headless failed (${e.message}) — opening visible browser`);
-          // Session expired or transient network timeout — fall through to visible browser login below.
-        } else {
-          throw e;
+          // Session expired — fall through to visible browser login below.
+          return refreshCookieWithVisibleBrowser({ userDataDir, proxy, maxWaitMs });
         }
+        throw e;
       }
-    } else {
-      console.log(`[cookieRefresh] account-${accountIndex + 1} no session found — opening visible browser for first-time login`);
     }
+
+    if (!headfulAllowed) {
+      throw new Error(explainHeadfulNotAvailable('未找到该账号的本地登录会话'));
+    }
+
+    console.log(`[cookieRefresh] account-${accountIndex + 1} no session found — opening visible browser for first-time login`);
 
     // First-time login or expired session: open visible browser.
     return refreshCookieWithVisibleBrowser({ userDataDir, proxy, maxWaitMs });

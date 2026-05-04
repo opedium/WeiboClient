@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, Component } from 'react';
+import { useState, useEffect, useCallback, useRef, Component } from 'react';
 import { OPERATIONS, GROUPS, RANDOM_SUPPORTED_OPS, BATCH_SUPPORTED_ENDPOINTS, SCHEDULABLE_OPERATIONS } from './config.js';
 
 const API = (() => {
@@ -494,6 +494,8 @@ function AccountsPanel({ onCountChange }) {
   const [validResults, setValidResults] = useState({}); // {index: {valid, name, uid, avatar, error, missingRec}}
   const [keepAliveLog, setKeepAliveLog] = useState(null);
   const [resetting, setResetting] = useState({}); // {index: true/false}
+  const [qrLogin, setQrLogin] = useState(null); // { index, sessionId, qrDataUrl, status, error, expiresAt }
+  const qrPollRef = useRef(null);
 
   useEffect(() => {
     fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
@@ -510,6 +512,15 @@ function AccountsPanel({ onCountChange }) {
     fetch(`${API}/api/keep-alive-log`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok && d.log) setKeepAliveLog(d.log);
     }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (qrPollRef.current) {
+        clearInterval(qrPollRef.current);
+        qrPollRef.current = null;
+      }
+    };
   }, []);
 
   const update = (i, field, value) => {
@@ -611,42 +622,174 @@ function AccountsPanel({ onCountChange }) {
     }
   };
 
+  const startQrRefreshFlow = async (i) => {
+    const res = await fetch(`${API}/api/accounts/${i}/qr-login/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+      body: JSON.stringify({ maxWaitMs: 180000 }),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(`服务器返回异常响应 (HTTP ${res.status})`); }
+    if (!data.ok && res.status !== 409) throw new Error(data.error ?? '二维码刷新启动失败');
+
+    const sessionId = String(data.sessionId ?? '').trim();
+    const qrDataUrl = String(data.qrDataUrl ?? '').trim();
+    if (!sessionId) {
+      throw new Error(data.error ?? '未拿到二维码会话 ID');
+    }
+
+    setQrLogin({
+      index: i,
+      sessionId,
+      qrDataUrl,
+      status: 'pending',
+      error: null,
+      expiresAt: data.expiresAt ?? null,
+    });
+
+    if (qrPollRef.current) {
+      clearInterval(qrPollRef.current);
+      qrPollRef.current = null;
+    }
+
+    const poll = async () => {
+      try {
+        const sres = await fetch(`${API}/api/accounts/${i}/qr-login/status?sessionId=${encodeURIComponent(sessionId)}`, {
+          headers: { 'x-auth-token': getToken() },
+        });
+        const stext = await sres.text();
+        let sdata;
+        try { sdata = JSON.parse(stext); } catch { throw new Error(`状态接口返回异常 (HTTP ${sres.status})`); }
+        if (!sdata.ok) throw new Error(sdata.error ?? '二维码登录状态查询失败');
+
+        setQrLogin(prev => {
+          if (!prev || prev.sessionId !== sessionId) return prev;
+          return {
+            ...prev,
+            status: sdata.status ?? prev.status,
+            error: sdata.error ?? null,
+            qrDataUrl: sdata.qrDataUrl || prev.qrDataUrl,
+            expiresAt: sdata.expiresAt ?? prev.expiresAt,
+          };
+        });
+
+        const terminal = ['success', 'failed', 'expired', 'cancelled'].includes(String(sdata.status ?? ''));
+        if (!terminal) return false;
+
+        if (qrPollRef.current) {
+          clearInterval(qrPollRef.current);
+          qrPollRef.current = null;
+        }
+        setRefreshing(v => ({ ...v, [i]: false }));
+
+        if (sdata.status === 'success') {
+          const refreshed = sdata.account ?? null;
+          if (refreshed) {
+            setAccounts(prev => prev.map((acc, idx) => idx === i ? {
+              ...acc,
+              cookie: '',
+              name: refreshed.name ?? acc.name,
+              hasCookie: !!refreshed.hasCookie,
+              cookieMasked: refreshed.cookieMasked ?? acc.cookieMasked,
+              proxy: refreshed.proxy ?? acc.proxy,
+            } : acc));
+          }
+          if (sdata.validated) {
+            setValidResults(v => ({ ...v, [i]: sdata.validated }));
+          }
+          setSaved(true);
+          setTimeout(() => setSaved(false), 1500);
+          setTimeout(() => setQrLogin(prev => (prev?.sessionId === sessionId ? null : prev)), 1200);
+          return true;
+        }
+
+        setSaveError(`账号 ${i + 1} 二维码刷新失败: ${sdata.error ?? sdata.status}`);
+        return true;
+      } catch (pollErr) {
+        if (qrPollRef.current) {
+          clearInterval(qrPollRef.current);
+          qrPollRef.current = null;
+        }
+        setRefreshing(v => ({ ...v, [i]: false }));
+        setSaveError(`账号 ${i + 1} 二维码刷新失败: ${pollErr.message}`);
+        return true;
+      }
+    };
+
+    const terminal = await poll();
+    if (!terminal) {
+      qrPollRef.current = setInterval(() => { void poll(); }, 2500);
+    }
+  };
+
   const refreshCookie = async (i) => {
     setSaveError(null);
     setRefreshing(v => ({ ...v, [i]: true }));
     try {
+      // Try silent refresh first. This avoids QR scan when server-side session is still alive.
       const res = await fetch(`${API}/api/accounts/${i}/refresh-cookie`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
-        body: JSON.stringify({ maxWaitMs: 180000 }),
+        body: JSON.stringify({ maxWaitMs: 120000 }),
       });
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { throw new Error(`服务器返回异常响应 (HTTP ${res.status})`); }
-      if (!data.ok) throw new Error(data.error ?? '刷新失败');
 
-      const refreshed = data.account ?? null;
-      if (refreshed) {
-        setAccounts(prev => prev.map((acc, idx) => idx === i ? {
-          ...acc,
-          cookie: '',
-          name: refreshed.name ?? acc.name,
-          hasCookie: !!refreshed.hasCookie,
-          cookieMasked: refreshed.cookieMasked ?? acc.cookieMasked,
-          proxy: refreshed.proxy ?? acc.proxy,
-        } : acc));
+      if (data.ok) {
+        const refreshed = data.account ?? null;
+        if (refreshed) {
+          setAccounts(prev => prev.map((acc, idx) => idx === i ? {
+            ...acc,
+            cookie: '',
+            name: refreshed.name ?? acc.name,
+            hasCookie: !!refreshed.hasCookie,
+            cookieMasked: refreshed.cookieMasked ?? acc.cookieMasked,
+            proxy: refreshed.proxy ?? acc.proxy,
+          } : acc));
+        }
+        if (data.validated) {
+          setValidResults(v => ({ ...v, [i]: data.validated }));
+        }
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1500);
+        setRefreshing(v => ({ ...v, [i]: false }));
+        return;
       }
 
-      if (data.validated) {
-        setValidResults(v => ({ ...v, [i]: data.validated }));
+      const errMsg = String(data.error ?? '').trim();
+      const shouldFallbackToQr = data.requiresQr === true ||
+        String(data.errorType ?? '').toLowerCase() === 'requires_qr_login' ||
+        /会话|session|可视化浏览器|Cookie 已过期|未找到该账号的本地登录会话/i.test(errMsg);
+      if (!shouldFallbackToQr) {
+        throw new Error(errMsg || '刷新失败');
       }
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+
+      await startQrRefreshFlow(i);
     } catch (err) {
       setSaveError(`账号 ${i + 1} 刷新失败: ${err.message}`);
-    } finally {
       setRefreshing(v => ({ ...v, [i]: false }));
     }
+  };
+
+  const cancelQrLogin = async (i) => {
+    const sessionId = String(qrLogin?.sessionId ?? '').trim();
+    try {
+      await fetch(`${API}/api/accounts/${i}/qr-login/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+        body: JSON.stringify({ sessionId }),
+      });
+    } catch (err) {
+      setSaveError(`取消二维码会话失败: ${err.message}`);
+    }
+    if (qrPollRef.current) {
+      clearInterval(qrPollRef.current);
+      qrPollRef.current = null;
+    }
+    setRefreshing(v => ({ ...v, [i]: false }));
+    setQrLogin(null);
   };
 
   return (
@@ -678,9 +821,9 @@ function AccountsPanel({ onCountChange }) {
                 className="btn-validate"
                 onClick={() => refreshCookie(i)}
                 disabled={!!refreshing[i]}
-                title="打开浏览器手动登录并自动保存 Cookie"
+                title="生成二维码并扫码登录，自动保存 Cookie"
               >
-                {refreshing[i] ? '刷新中…' : '刷新Cookie'}
+                {refreshing[i] ? '扫码中…' : '刷新Cookie'}
               </button>
               <button
                 className="btn-reset-browser"
@@ -707,11 +850,35 @@ function AccountsPanel({ onCountChange }) {
                 {vr.valid ? (
                   <>
                     {vr.avatar && <img className="status-avatar" src={vr.avatar} alt="" />}
-                    <span>✓ 有效 · {vr.name}（UID {vr.uid}）</span>
+                    <span>✓ 有效 · {vr.name}{vr.uid ? `（UID ${vr.uid}）` : ''}</span>
                     {vr.missingRec?.length > 0 && <span className="status-warn"> · 建议补充: {vr.missingRec.join(', ')}</span>}
                   </>
                 ) : (
                   <span>✗ {vr.error}{vr.missingRec?.length > 0 ? ` · 建议补充: ${vr.missingRec.join(', ')}` : ''}</span>
+                )}
+              </div>
+            )}
+            {qrLogin?.index === i && qrLogin?.sessionId && (
+              <div className="cookie-status" style={{ display: 'block' }}>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>扫码登录刷新 Cookie</div>
+                {qrLogin.qrDataUrl ? (
+                  <img
+                    src={qrLogin.qrDataUrl}
+                    alt="微博登录二维码"
+                    style={{ width: 220, height: 220, objectFit: 'contain', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, background: '#fff' }}
+                  />
+                ) : (
+                  <div>二维码加载中...</div>
+                )}
+                <div style={{ marginTop: 8, opacity: 0.9 }}>
+                  状态：{qrLogin.status === 'pending' ? '等待扫码/确认' : qrLogin.status}
+                  {qrLogin.expiresAt ? ` · 过期时间 ${new Date(qrLogin.expiresAt).toLocaleTimeString()}` : ''}
+                </div>
+                {qrLogin.error && <div style={{ marginTop: 6, color: '#ffb4b4' }}>{qrLogin.error}</div>}
+                {qrLogin.status === 'pending' && (
+                  <div style={{ marginTop: 10 }}>
+                    <button className="btn-secondary" onClick={() => cancelQrLogin(i)}>取消扫码</button>
+                  </div>
                 )}
               </div>
             )}

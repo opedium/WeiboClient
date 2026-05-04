@@ -8,7 +8,15 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { createClient, bidToMid } from './weibo.js';
-import { refreshCookieViaManualLogin, keepAliveAllAccounts, resetBrowserProfile, checkPlaywrightRuntime } from './cookieRefresh.js';
+import {
+  refreshCookieViaManualLogin,
+  keepAliveAllAccounts,
+  resetBrowserProfile,
+  checkPlaywrightRuntime,
+  startQrLoginSession,
+  getQrLoginStatus,
+  cancelQrLoginSession,
+} from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
 
@@ -25,6 +33,8 @@ const CORS_ALLOW_ALL = CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes('*');
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN ?? '').trim();
 const AUTH_REQUIRED = String(process.env.AUTH_REQUIRED ?? (AUTH_TOKEN ? 'true' : 'false')).toLowerCase() === 'true';
 const PUBLIC_ROUTES = new Set(['/api/login', '/api/logout', '/api/me', '/api/health']);
+const MONGODB_URI = String(process.env.MONGODB_URI ?? '').trim();
+const COOKIE_SECRET = String(process.env.COOKIE_SECRET ?? '').trim();
 
 function safeTokenEqual(a, b) {
   const aa = Buffer.from(String(a ?? ''), 'utf8');
@@ -171,10 +181,16 @@ function classifyBackendError(err) {
 }
 
 async function validateCookieLive(cookieStr, proxy = '') {
-  const xsrf = (() => {
-    const raw = cookieFieldValue(cookieStr, 'XSRF-TOKEN');
-    try { return decodeURIComponent(raw); } catch { return raw; }
+  const xsrfRaw = cookieFieldValue(cookieStr, 'XSRF-TOKEN');
+  const xsrfDecoded = (() => {
+    try { return decodeURIComponent(xsrfRaw); } catch { return xsrfRaw; }
   })();
+  const xsrfCandidates = Array.from(new Set([
+    xsrfRaw,
+    xsrfDecoded,
+    xsrfDecoded ? encodeURIComponent(xsrfDecoded) : '',
+  ].filter(Boolean)));
+
   const proxyOpts = (typeof proxy === 'string' && proxy.trim())
     ? (() => {
         try {
@@ -184,9 +200,9 @@ async function validateCookieLive(cookieStr, proxy = '') {
         }
       })()
     : {};
+
   const commonHeaders = {
     'Cookie': cookieStr,
-    'x-xsrf-token': xsrf,
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Referer': 'https://weibo.com',
     'Origin': 'https://weibo.com',
@@ -195,40 +211,79 @@ async function validateCookieLive(cookieStr, proxy = '') {
     'Accept-Language': 'zh-CN,zh;q=0.9',
   };
 
-  const tryFetch = async (url) => {
+  const tryFetch = async (url, xsrfToken = '') => {
+    const headers = xsrfToken
+      ? { ...commonHeaders, 'x-xsrf-token': xsrfToken }
+      : commonHeaders;
     const resp = await axios.get(url, {
-      headers: commonHeaders,
+      headers,
       validateStatus: () => true,
+      timeout: 25_000,
       ...proxyOpts,
     });
-    const text = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
+    if (resp.data && typeof resp.data === 'object') return resp.data;
+    const text = typeof resp.data === 'string' ? resp.data : '';
     try { return JSON.parse(text); } catch { return null; }
   };
 
-  let data = await tryFetch('https://weibo.com/ajax/statuses/mymblog?page=1&feature=0');
-  if (data?.ok === 1) {
-    const user = data?.data?.list?.[0]?.user ?? null;
-    return {
-      valid: true,
-      uid: user?.id ?? null,
-      name: user?.screen_name ?? '已验证',
-      avatar: user?.profile_image_url ?? null,
-      reason: null,
-    };
+  const urls = [
+    'https://weibo.com/ajax/profile/info',
+    'https://weibo.com/ajax/statuses/mymblog?page=1&feature=0',
+  ];
+
+  let seenLoginError = false;
+  let seenDataFetchRestricted = false;
+  let lastMessage = '';
+
+  for (const xsrf of [...xsrfCandidates, '']) {
+    for (const url of urls) {
+      let data = null;
+      try {
+        data = await tryFetch(url, xsrf);
+      } catch {
+        continue;
+      }
+
+      const user = data?.data?.user ?? data?.user ?? data?.data?.list?.[0]?.user ?? null;
+      if (user?.id || user?.idstr || user?.screen_name) {
+        return {
+          valid: true,
+          uid: user.id ?? user.idstr ?? null,
+          name: user.screen_name ?? user.name ?? '已验证',
+          avatar: user.profile_image_url ?? null,
+          reason: null,
+        };
+      }
+
+      if (data?.ok === 1 && data?.data) {
+        return {
+          valid: true,
+          uid: null,
+          name: '已验证',
+          avatar: null,
+          reason: null,
+        };
+      }
+
+      const msg = String(data?.msg ?? data?.message ?? data?.error ?? '').trim();
+      if (msg) lastMessage = msg;
+      if (/10017/.test(msg) || /获取数据失败\(10017\)/.test(msg)) {
+        seenDataFetchRestricted = true;
+      }
+      if (/未登录|登录|cookie|session|invalid|expired|权限/i.test(msg)) {
+        seenLoginError = true;
+      }
+    }
   }
 
-  if (hasCookieField(cookieStr, 'SUB')) {
-    data = await tryFetch('https://weibo.com/ajax/profile/info');
-    const user = data?.data?.user;
-    if (user) {
-      return {
-        valid: true,
-        uid: user.id,
-        name: user.screen_name,
-        avatar: user.profile_image_url,
-        reason: null,
-      };
-    }
+  if (seenDataFetchRestricted && !seenLoginError) {
+    return {
+      valid: true,
+      uid: null,
+      name: '已验证(接口受限)',
+      avatar: null,
+      reason: '微博接口返回 10017（数据获取受限），Cookie 可能有效但该校验接口被风控/限流。',
+    };
   }
 
   return {
@@ -236,11 +291,14 @@ async function validateCookieLive(cookieStr, proxy = '') {
     uid: null,
     name: null,
     avatar: null,
-    reason: data ? 'Cookie 无效或已过期' : '服务器返回非 JSON 响应',
+    reason: seenLoginError
+      ? (lastMessage || 'Cookie 无效或已过期')
+      : (lastMessage ? `验证失败: ${lastMessage}` : '服务器返回非预期响应，请检查代理或网络'),
   };
 }
 
 const refreshLocks = new Set();
+const activeQrSessionByAccount = new Map();
 
 // helper: get account index from request (header or body)
 function accountIdx(req) {
@@ -260,7 +318,6 @@ function resolveMid(val) {
 function resolveCid(val) {
   if (!val) return null;
   const s = String(val).trim();
-  if (!s) return null;
   if (/^\d+$/.test(s)) return s;
 
   // For reply-comment links, rid is often the real target comment id.
@@ -473,6 +530,7 @@ app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
       accountName: accounts[idx]?.name ?? '',
       proxy: accounts[idx]?.proxy ?? '',
       maxWaitMs,
+      allowVisibleBrowser: false,
     });
 
     const check = checkCookieFields(refreshed.cookie);
@@ -510,11 +568,169 @@ app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
       message: 'Cookie 已刷新并保存',
     });
   } catch (e) {
+    const msg = String(e?.message ?? '');
+    if (/本地登录会话|可视化浏览器|Cookie 已过期|SESSION_EXPIRED/i.test(msg)) {
+      return res.status(409).json({
+        ok: false,
+        error: msg,
+        errorType: 'requires_qr_login',
+        requiresQr: true,
+      });
+    }
     const classified = classifyBackendError(e);
     return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
   } finally {
     refreshLocks.delete(idx);
   }
+});
+
+app.post('/api/accounts/:index/qr-login/start', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+  if (refreshLocks.has(idx)) {
+    const existingSessionId = activeQrSessionByAccount.get(idx);
+    if (existingSessionId) {
+      const existing = getQrLoginStatus(existingSessionId);
+      if (existing.found && existing.status === 'pending') {
+        return res.status(409).json({
+          ok: false,
+          error: '该账号已有进行中的二维码登录会话',
+          sessionId: existingSessionId,
+          qrDataUrl: existing.qrDataUrl,
+          expiresAt: existing.expiresAt,
+        });
+      }
+    }
+    return res.status(409).json({ ok: false, error: '该账号正在刷新 Cookie，请稍候重试' });
+  }
+
+  refreshLocks.add(idx);
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    const maxWaitMs = Math.min(10 * 60 * 1000, Math.max(60 * 1000, Number.parseInt(req.body?.maxWaitMs ?? 180000, 10) || 180000));
+    const started = await startQrLoginSession({
+      accountIndex: idx,
+      accountName: accounts[idx]?.name ?? '',
+      proxy: accounts[idx]?.proxy ?? '',
+      maxWaitMs,
+    });
+
+    activeQrSessionByAccount.set(idx, started.sessionId);
+    return res.json({ ok: true, ...started, message: '二维码已生成，请扫码登录' });
+  } catch (e) {
+    refreshLocks.delete(idx);
+    activeQrSessionByAccount.delete(idx);
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  }
+});
+
+app.get('/api/accounts/:index/qr-login/status', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  const sessionId = String(req.query.sessionId ?? '').trim();
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: '缺少 sessionId' });
+  }
+
+  const status = getQrLoginStatus(sessionId);
+  if (!status.found) {
+    refreshLocks.delete(idx);
+    activeQrSessionByAccount.delete(idx);
+    return res.status(404).json({ ok: false, error: status.error ?? '会话不存在', status: status.status });
+  }
+
+  if (status.accountIndex !== idx) {
+    return res.status(400).json({ ok: false, error: '会话与账号索引不匹配' });
+  }
+
+  if (status.status !== 'success') {
+    if (status.status === 'failed' || status.status === 'expired' || status.status === 'cancelled') {
+      refreshLocks.delete(idx);
+      activeQrSessionByAccount.delete(idx);
+    }
+    return res.json({ ok: true, ...status });
+  }
+
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      refreshLocks.delete(idx);
+      activeQrSessionByAccount.delete(idx);
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    const refreshedCookie = String(status.cookie ?? '').trim();
+    const check = checkCookieFields(refreshedCookie);
+    if (check.missing.length) {
+      refreshLocks.delete(idx);
+      activeQrSessionByAccount.delete(idx);
+      return res.status(400).json({ ok: false, error: `扫码完成但 Cookie 缺少字段: ${check.missing.join(', ')}`, missing: check.missing });
+    }
+
+    let live = { valid: false, uid: null, name: null, avatar: null, reason: '未校验' };
+    try {
+      live = await validateCookieLive(refreshedCookie, accounts[idx]?.proxy ?? '');
+    } catch (e) {
+      live = { valid: false, uid: null, name: null, avatar: null, reason: `刷新后校验失败: ${e.message}` };
+    }
+
+    const updated = accounts.map((a, i) => (i === idx ? {
+      ...a,
+      cookie: refreshedCookie,
+      uid: live.valid && live.uid ? String(live.uid) : String(a.uid ?? '').trim(),
+    } : a));
+    await setAccounts(updated);
+    const clean = sanitizeAccountsForResponse(updated);
+
+    refreshLocks.delete(idx);
+    activeQrSessionByAccount.delete(idx);
+
+    return res.json({
+      ok: true,
+      ...status,
+      account: clean[idx],
+      validated: {
+        valid: !!live.valid,
+        uid: live.uid,
+        name: live.name,
+        avatar: live.avatar,
+        error: live.valid ? null : live.reason,
+        missingRec: check.missingRec,
+      },
+      message: 'Cookie 已通过二维码登录刷新并保存',
+    });
+  } catch (e) {
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  }
+});
+
+app.post('/api/accounts/:index/qr-login/cancel', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+  const sessionId = String(req.body?.sessionId ?? '').trim() || String(activeQrSessionByAccount.get(idx) ?? '');
+  if (!sessionId) {
+    refreshLocks.delete(idx);
+    activeQrSessionByAccount.delete(idx);
+    return res.json({ ok: true, status: 'noop' });
+  }
+
+  const result = await cancelQrLoginSession(sessionId);
+  refreshLocks.delete(idx);
+  activeQrSessionByAccount.delete(idx);
+  return res.json({ ok: true, ...result });
 });
 
 // ── tweet ─────────────────────────────────────────────────
@@ -1103,6 +1319,9 @@ function startCookieKeepAlive() {
 async function start() {
   if (AUTH_REQUIRED && !AUTH_TOKEN) {
     throw new Error('AUTH_REQUIRED=true but AUTH_TOKEN is empty. Refusing to start.');
+  }
+  if (MONGODB_URI && !/^[0-9a-fA-F]{64}$/.test(COOKIE_SECRET)) {
+    throw new Error('MONGODB_URI is set but COOKIE_SECRET is missing/invalid. Set COOKIE_SECRET to a 64-char hex string.');
   }
   if (!AUTH_REQUIRED) {
     console.warn('[security] Auth middleware is disabled (AUTH_REQUIRED=false).');
