@@ -10,3 +10,4 @@ weibo-app/backend/account-names.json
 weibo-app/backend/copywriting.json
 !weibo-app/backend/account-names.example.json
 !weibo-app/backend/copywriting.example.json
+weibo-app/backend/.auth-profiles/
