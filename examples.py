@@ -63,6 +63,26 @@ def ac_04_follow_super_topic(topic_id: str, name: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ac_04_1  超话签到
+# topic_id 可通过 client.fetch_super_topics() 获取
+# ─────────────────────────────────────────────────────────────────────────────
+def ac_04_1_checkin_super_topic(topic_id: str):
+    result = client.checkin_super_topic(topic_id=topic_id)
+    print(f'[超话签到] {result}')
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ac_04_2  超话签到（按名称）
+# 通过超话名称自动搜索并签到，更方便！
+# ─────────────────────────────────────────────────────────────────────────────
+def ac_04_2_checkin_super_topic_by_name(name: str):
+    result = client.checkin_super_topic_by_name(name=name)
+    print(f'[超话签到] {result}')
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ac_05  发布微博（纯文字 / 图片 / 视频）
 # ─────────────────────────────────────────────────────────────────────────────
 def ac_05_post_tweet_text(content: str):

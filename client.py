@@ -165,6 +165,18 @@ def ac_04():
     result   = client.follow_super_topic(topic_id=topic_id, name=name)
     print_result(result)
 
+def ac_04_1():
+    """超话签到"""
+    topic_id = ask('超话 topic_id')
+    result   = client.checkin_super_topic(topic_id=topic_id)
+    print_result(result)
+
+def ac_04_2():
+    """超话签到（按名称）"""
+    name   = ask('超话名称')
+    result = client.checkin_super_topic_by_name(name=name)
+    print_result(result)
+
 def ac_05():
     """发布微博"""
     print('  类型: 1=纯文字  2=图片  3=视频')

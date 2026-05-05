@@ -592,7 +592,6 @@ export async function refreshCookieViaManualLogin({ accountIndex, accountName = 
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const userDataDir = profileDirForAccount(accountIndex, accountName);
   fs.mkdirSync(userDataDir, { recursive: true });
-  const headfulAllowed = allowVisibleBrowser && canOpenVisibleBrowser();
 
   return withProfileLock(userDataDir, async () => {
     if (profileHasSession(userDataDir)) {
@@ -601,24 +600,12 @@ export async function refreshCookieViaManualLogin({ accountIndex, accountName = 
         return await refreshCookieHeadless({ userDataDir, proxy });
       } catch (e) {
         if (e.message === 'SESSION_EXPIRED') {
-          if (!headfulAllowed) {
-            throw new Error(explainHeadfulNotAvailable('Cookie 已过期，且无法打开可视化浏览器进行手动登录'));
-          }
-          console.log(`[cookieRefresh] account-${accountIndex + 1} headless failed (${e.message}) — opening visible browser`);
-          // Session expired — fall through to visible browser login below.
-          return refreshCookieWithVisibleBrowser({ userDataDir, proxy, maxWaitMs });
+          throw new Error(explainHeadfulNotAvailable('Cookie 已过期，请改用页面二维码登录刷新'));
         }
         throw e;
       }
     }
 
-    if (!headfulAllowed) {
-      throw new Error(explainHeadfulNotAvailable('未找到该账号的本地登录会话'));
-    }
-
-    console.log(`[cookieRefresh] account-${accountIndex + 1} no session found — opening visible browser for first-time login`);
-
-    // First-time login or expired session: open visible browser.
-    return refreshCookieWithVisibleBrowser({ userDataDir, proxy, maxWaitMs });
+    throw new Error(explainHeadfulNotAvailable('未找到该账号会话，请改用页面二维码登录'));
   });
 }

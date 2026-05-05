@@ -259,6 +259,23 @@ function EntityCard({ item, opId }) {
     return <div className="entity-meta">{String(item)}</div>;
   }
 
+  // Special handling for check-in responses
+  if (item.code === '100000' && item.msg === '已签到' && item.topicName) {
+    const data = item.data ?? {};
+    return (
+      <div className="post-card">
+        <div className="post-user" style={{ color: 'var(--ok, #0a0)' }}>✓ 签到成功</div>
+        <div className="post-content">
+          <strong>{item.topicName}</strong>
+        </div>
+        <div className="post-meta">
+          {data.alert_title && <div>{data.alert_title}</div>}
+          {data.tipMessage && <div>{data.tipMessage}</div>}
+        </div>
+      </div>
+    );
+  }
+
   const text = stripHtml(item.text ?? item.text_raw ?? item.comment ?? '');
   const createdAt = stripHtml(item.created_at ?? item.create_time ?? item.time ?? '');
   const source = stripHtml(item.source ?? item.region_name ?? item.from ?? '');
@@ -1084,14 +1101,41 @@ function SchedulesPanel({ accountNames }) {
   const [error, setError] = useState('');
   // form state
   const [showForm, setShowForm] = useState(false);
+  const [editingJobId, setEditingJobId] = useState(null);
   const [formOp, setFormOp] = useState(SCHEDULABLE_OPERATIONS[0] ?? null);
   const [formFields, setFormFields] = useState({});
   const [formScheduledAt, setFormScheduledAt] = useState('');
-  const [formRepeat, setFormRepeat] = useState('');
+  const [formRepeatValue, setFormRepeatValue] = useState('');
+  const [formRepeatUnit, setFormRepeatUnit] = useState('minutes');
+  const [formRepeatCount, setFormRepeatCount] = useState('');
+  const [formUseRandom, setFormUseRandom] = useState(false);
+  const [formRandomGroup, setFormRandomGroup] = useState('');
+  const [formCopyGroups, setFormCopyGroups] = useState([]);
   const [formAccounts, setFormAccounts] = useState([0]);
   const [formName, setFormName] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
+  
+  // Helper to convert repeat config to minutes
+  const getRepeatMinutes = () => {
+    const val = Number(formRepeatValue);
+    if (!val || val <= 0) return undefined;
+    const unitMultipliers = { minutes: 1, hours: 60, days: 1440, weeks: 10080 };
+    return val * (unitMultipliers[formRepeatUnit] ?? 1);
+  };
+
+  // Check if current operation supports random copywriting
+  const canFormRandom = RANDOM_SUPPORTED_OPS.has(formOp?.endpoint);
+
+  // Load copywriting groups when random is enabled
+  useEffect(() => {
+    if (formUseRandom && canFormRandom && formCopyGroups.length === 0) {
+      fetch(`${API}/api/copywriting`, { headers: { 'x-auth-token': getToken() } })
+        .then(r => r.json())
+        .then(d => { if (d.ok) setFormCopyGroups(d.groups ?? []); })
+        .catch(() => {});
+    }
+  }, [formUseRandom, canFormRandom, formCopyGroups.length]);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -1131,6 +1175,42 @@ function SchedulesPanel({ accountNames }) {
     else { alert('已触发执行'); load(); }
   };
 
+  const editJob = (job) => {
+    const op = SCHEDULABLE_OPERATIONS.find(o => o.endpoint === job.endpoint);
+    if (!op) { alert('操作不支持'); return; }
+    
+    const body = job.body ?? {};
+    const repeatMinutes = job.repeatMinutes ?? 0;
+    let repeatValue = '';
+    let repeatUnit = 'minutes';
+    
+    if (repeatMinutes > 0) {
+      if (repeatMinutes % 10080 === 0) { repeatValue = String(Math.floor(repeatMinutes / 10080)); repeatUnit = 'weeks'; }
+      else if (repeatMinutes % 1440 === 0) { repeatValue = String(Math.floor(repeatMinutes / 1440)); repeatUnit = 'days'; }
+      else if (repeatMinutes % 60 === 0) { repeatValue = String(Math.floor(repeatMinutes / 60)); repeatUnit = 'hours'; }
+      else { repeatValue = String(repeatMinutes); repeatUnit = 'minutes'; }
+    }
+    
+    setFormOp(op);
+    setFormFields(body);
+    setFormName(job.name ?? '');
+    setFormScheduledAt(job.scheduledAt ? new Date(job.scheduledAt).toISOString().slice(0, 16) : '');
+    setFormRepeatValue(repeatValue);
+    setFormRepeatUnit(repeatUnit);
+    setFormRepeatCount(job.repeatCount ? String(job.repeatCount) : '');
+    setFormUseRandom(body.useRandom ?? false);
+    setFormRandomGroup(body.randomGroup ?? '');
+    setFormAccounts(job.selectedAccounts ?? [0]);
+    setEditingJobId(job.id || job._dbId);
+    setShowForm(true);
+  };
+
+  const cancelEdit = () => {
+    setEditingJobId(null);
+    setShowForm(false);
+    setFormName(''); setFormFields({}); setFormScheduledAt(''); setFormRepeatValue(''); setFormRepeatUnit('minutes'); setFormRepeatCount(''); setFormUseRandom(false); setFormRandomGroup(''); setFormAccounts([0]);
+  };
+
   const submitJob = async () => {
     if (!formOp) return;
     if (!formScheduledAt) { setFormError('请选择执行时间'); return; }
@@ -1145,22 +1225,35 @@ function SchedulesPanel({ accountNames }) {
       const body = {
         name: formName || `${formOp.label} - ${new Date(formScheduledAt).toLocaleString()}`,
         endpoint: formOp.endpoint,
-        body: formFields,
+        body: canFormRandom && formUseRandom
+          ? { ...formFields, useRandom: true, randomField: 'content', randomGroup: formRandomGroup || null }
+          : formFields,
         selectedAccounts: formAccounts,
         scheduledAt: new Date(formScheduledAt).toISOString(),
-        repeatMinutes: formRepeat ? Number(formRepeat) : undefined,
+        repeatMinutes: getRepeatMinutes(),
+        repeatCount: formRepeatCount ? Number(formRepeatCount) : undefined,
         delay: 1000,
         loops: 1,
         roundDelay: 500,
       };
-      const r = await fetch(`${API}/api/schedules`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
-        body: JSON.stringify(body),
-      });
+      
+      let r;
+      if (editingJobId) {
+        r = await fetch(`${API}/api/schedules/${editingJobId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+          body: JSON.stringify(body),
+        });
+      } else {
+        r = await fetch(`${API}/api/schedules`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+          body: JSON.stringify(body),
+        });
+      }
       const d = await r.json();
-      if (!d.ok) throw new Error(d.error ?? '创建失败');
-      setShowForm(false); setFormName(''); setFormFields({}); setFormScheduledAt(''); setFormRepeat(''); setFormAccounts([0]);
+      if (!d.ok) throw new Error(d.error ?? '保存失败');
+      setShowForm(false); setEditingJobId(null); setFormName(''); setFormFields({}); setFormScheduledAt(''); setFormRepeatValue(''); setFormRepeatUnit('minutes'); setFormRepeatCount(''); setFormUseRandom(false); setFormRandomGroup(''); setFormAccounts([0]);
       load();
     } catch (e) {
       setFormError(e.message);
@@ -1181,8 +1274,8 @@ function SchedulesPanel({ accountNames }) {
         <h2 className="panel-title">定时任务</h2>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn-secondary" onClick={load}>刷新</button>
-          <button className="btn-submit" onClick={() => setShowForm(v => !v)}>
-            {showForm ? '取消' : '+ 新建任务'}
+          <button className="btn-submit" onClick={() => { if (editingJobId) cancelEdit(); else setShowForm(v => !v); }}>
+            {editingJobId ? '取消编辑' : showForm ? '取消' : '+ 新建任务'}
           </button>
         </div>
       </div>
@@ -1221,9 +1314,46 @@ function SchedulesPanel({ accountNames }) {
             <input type="datetime-local" className="sched-input" value={formScheduledAt} onChange={e => setFormScheduledAt(e.target.value)} />
           </div>
           <div className="sched-form-row">
-            <label>重复间隔（分钟）</label>
-            <input type="number" className="sched-input" value={formRepeat} onChange={e => setFormRepeat(e.target.value)} placeholder="留空则不重复" min="1" style={{ width: 120 }} />
+            <label>重复间隔</label>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input type="number" className="sched-input" value={formRepeatValue} onChange={e => setFormRepeatValue(e.target.value)} placeholder="数值" min="1" style={{ width: 80 }} />
+              <select className="sched-select" value={formRepeatUnit} onChange={e => setFormRepeatUnit(e.target.value)} style={{ flex: 1, minWidth: 100 }}>
+                <option value="minutes">分钟</option>
+                <option value="hours">小时</option>
+                <option value="days">天</option>
+                <option value="weeks">周</option>
+              </select>
+              {getRepeatMinutes() && <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>({getRepeatMinutes()} 分钟)</span>}
+            </div>
           </div>
+          <div className="sched-form-row">
+            <label>重复次数</label>
+            <input type="number" className="sched-input" value={formRepeatCount} onChange={e => setFormRepeatCount(e.target.value)} placeholder="不限制为空" min="1" style={{ width: 120 }} />
+          </div>
+          {canFormRandom && (
+            <div className="sched-form-row">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={formUseRandom}
+                  onChange={e => { setFormUseRandom(e.target.checked); if (!e.target.checked) setFormRandomGroup(''); }}
+                  style={{ marginRight: 6 }}
+                />
+                使用随机文案
+              </label>
+            </div>
+          )}
+          {formUseRandom && canFormRandom && (
+            <div className="sched-form-row">
+              <label>文案组</label>
+              <select className="sched-select" value={formRandomGroup} onChange={e => setFormRandomGroup(e.target.value)}>
+                <option value="">{formCopyGroups.length === 0 ? '加载中...' : '随机选择'}</option>
+                {formCopyGroups.map(g => (
+                  <option key={g.name} value={g.name}>{g.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="sched-form-row">
             <label>账号</label>
             <div className="sched-account-chips">
@@ -1241,7 +1371,7 @@ function SchedulesPanel({ accountNames }) {
           </div>
           {formError && <div className="sched-form-error">{formError}</div>}
           <button className="btn-submit" onClick={submitJob} disabled={submitting}>
-            {submitting ? '创建中…' : '创建任务'}
+            {submitting ? (editingJobId ? '保存中…' : '创建中…') : (editingJobId ? '保存任务' : '创建任务')}
           </button>
         </div>
       )}
@@ -1260,7 +1390,16 @@ function SchedulesPanel({ accountNames }) {
             <div className="sched-job-meta">
               <span>操作: {job.endpoint}</span>
               <span>计划时间: {job.scheduledAt ? new Date(job.scheduledAt).toLocaleString() : '—'}</span>
-              {job.repeatMinutes && <span>每 {job.repeatMinutes} 分钟重复</span>}
+              {job.repeatMinutes && (() => {
+                const m = job.repeatMinutes;
+                let intervalText = '';
+                if (m % 10080 === 0) intervalText = `每 ${Math.floor(m / 10080)} 周重复`;
+                else if (m % 1440 === 0) intervalText = `每 ${Math.floor(m / 1440)} 天重复`;
+                else if (m % 60 === 0) intervalText = `每 ${Math.floor(m / 60)} 小时重复`;
+                else intervalText = `每 ${m} 分钟重复`;
+                if (job.repeatCount) return <span>{intervalText} (已执行 {job.runCount ?? 0} / {job.repeatCount} 次)</span>;
+                return <span>{intervalText}</span>;
+              })()}
               {job.lastRunAt && <span>上次执行: {new Date(job.lastRunAt).toLocaleString()}</span>}
             </div>
             {job.lastResult && (
@@ -1268,6 +1407,7 @@ function SchedulesPanel({ accountNames }) {
             )}
             <div className="sched-job-actions">
               <button className="btn-secondary" onClick={() => runNow(job.id || job._dbId)}>立即执行</button>
+              <button className="btn-secondary" onClick={() => editJob(job)}>编辑</button>
               <button className="btn-danger" onClick={() => deleteJob(job)}>删除</button>
             </div>
           </div>

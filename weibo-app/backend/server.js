@@ -1,4 +1,7 @@
 // server.js — Express API server
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -875,6 +878,39 @@ app.post('/api/follow-super-topic', wrap(async (client, req) => {
   return client.followSuperTopic({ topicId, name });
 }));
 
+app.post('/api/checkin-super-topic-by-name', wrap(async (client, req) => {
+  const { name } = req.body;
+  if (!name || !String(name).trim()) {
+    return { ok: 0, message: '请提供超话名称' };
+  }
+  
+  // Search for the topic by name
+  const searchResult = await client.searchSuperTopics({ keyword: name, page: 1 });
+  
+  // Check if search was successful and found results
+  if (!searchResult?.ok || !searchResult?.data || searchResult.data.length === 0) {
+    return { ok: 0, message: `未找到超话: ${name}` };
+  }
+  
+  // Get the first result
+  const topic = searchResult.data[0];
+  const topicOid = topic.act_log?.oid || topic.page_id;
+  
+  if (!topicOid) {
+    return { ok: 0, message: '无法获取超话ID' };
+  }
+  
+  // Now check in
+  const checkinResult = await client.checkinSuperTopic({ topicId: topicOid });
+  
+  // Add the topic info to the response
+  return {
+    ...checkinResult,
+    topicName: topic.title,
+    topicId: topicOid,
+  };
+}));
+
 // ── fetch ─────────────────────────────────────────────────
 app.get('/api/friends-tweets', wrap(async (client, req) => {
   return client.fetchFriendsTweets({ sinceId: req.query.sinceId });
@@ -890,6 +926,12 @@ app.get('/api/collections', wrap(async (client) => {
 
 app.get('/api/groups', wrap(async (client) => {
   return client.fetchGroups();
+}));
+
+app.get('/api/super-topics', wrap(async (client, req) => {
+  const cateId = req.query.cateId ?? '123333';
+  const page = req.query.page ?? 1;
+  return client.fetchSuperTopics({ cateId, page });
 }));
 
 // ── inbox / notifications ─────────────────────────────────
@@ -1092,6 +1134,7 @@ app.post('/api/schedules', async (req, res) => {
       selectedAccounts,
       scheduledAt,
       repeatMinutes,
+      repeatCount,
     } = req.body ?? {};
 
     if (!batchHandlers[endpoint]) {
@@ -1111,10 +1154,55 @@ app.post('/api/schedules', async (req, res) => {
       selectedAccounts: Array.isArray(selectedAccounts) ? selectedAccounts : [],
       scheduledAt: new Date(scheduledAt).toISOString(),
       repeatMinutes: repeatMinutes ? Math.max(1, Number(repeatMinutes) || 0) : null,
+      repeatCount: repeatCount ? Math.max(1, Number(repeatCount) || 0) : null,
       status: 'pending',
       createdAt: new Date().toISOString(),
     });
     res.json({ ok: true, job });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.patch('/api/schedules/:id', async (req, res) => {
+  try {
+    const {
+      name,
+      endpoint,
+      body = {},
+      delay = 3000,
+      loops = 1,
+      roundDelay = 0,
+      selectedAccounts,
+      scheduledAt,
+      repeatMinutes,
+      repeatCount,
+    } = req.body ?? {};
+
+    if (!batchHandlers[endpoint]) {
+      return res.status(400).json({ ok: false, error: `Batch not supported for: ${endpoint}` });
+    }
+    if (!scheduledAt) {
+      return res.status(400).json({ ok: false, error: 'scheduledAt is required' });
+    }
+
+    const patch = {
+      name: String(name ?? '').trim(),
+      endpoint,
+      body,
+      delay: Number(delay) || 0,
+      loops: Math.max(1, Number(loops) || 1),
+      roundDelay: Number(roundDelay) || 0,
+      selectedAccounts: Array.isArray(selectedAccounts) ? selectedAccounts : [],
+      scheduledAt: new Date(scheduledAt).toISOString(),
+      repeatMinutes: repeatMinutes ? Math.max(1, Number(repeatMinutes) || 0) : null,
+      repeatCount: repeatCount ? Math.max(1, Number(repeatCount) || 0) : null,
+      status: 'pending',
+      runCount: 0,
+    };
+
+    await updateSchedule(req.params.id, patch);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -1201,14 +1289,27 @@ async function runScheduleJob(job) {
     }
 
     const patch = {
-      status: 'done',
       lastRunAt: new Date().toISOString(),
       lastResult: results,
     };
+    
+    // Handle repetition with optional repeat count limit
     if (job.repeatMinutes) {
-      patch.status = 'pending';
-      patch.scheduledAt = new Date(Date.now() + Number(job.repeatMinutes) * 60 * 1000).toISOString();
+      const runCount = (job.runCount ?? 0) + 1;
+      const shouldContinue = !job.repeatCount || runCount < job.repeatCount;
+      
+      if (shouldContinue) {
+        patch.status = 'pending';
+        patch.scheduledAt = new Date(Date.now() + Number(job.repeatMinutes) * 60 * 1000).toISOString();
+        patch.runCount = runCount;
+      } else {
+        patch.status = 'done';
+        patch.runCount = runCount;
+      }
+    } else {
+      patch.status = 'done';
     }
+    
     await updateSchedule(job.id, patch);
   } catch (err) {
     await updateSchedule(job.id, {

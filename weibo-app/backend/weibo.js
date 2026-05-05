@@ -258,6 +258,37 @@ export function createClient(cookieOrIndex = 0, cookieList = null, proxy = null)
       });
     },
 
+    checkinSuperTopic({ topicId }) {
+      // Extract the hex ID (remove "1022:" prefix if present)
+      const hexId = topicId.includes(':') ? topicId.split(':')[1] : topicId;
+      
+      // The check-in goes through weibo.com/p/aj/general/button proxy endpoint
+      // which forwards to i.huati.weibo.com/aj/super/checkin
+      return get('https://weibo.com/p/aj/general/button', {
+        ajwvr: 6,
+        api: 'http://i.huati.weibo.com/aj/super/checkin',
+        texta: '签到',
+        textb: '已签到',
+        status: 0,
+        id: hexId,
+        location: `page_${hexId.slice(0, 6)}_super_index`,
+        timezone: 'GMT+0800',
+        lang: 'zh-cn',
+        plat: 'Win32',
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0',
+        screen: '1920*1080',
+        __rnd: Date.now(),
+      });
+    },
+
+    searchSuperTopics({ keyword, page = 1 } = {}) {
+      return get('https://weibo.com/ajax/stopic/list', {
+        sort_id: 0,
+        keyword,
+        page,
+      });
+    },
+
     uploadPicture(buffer, watermark = '') {
       const md5 = (() => {
         // simple md5 via crypto

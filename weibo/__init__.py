@@ -1316,6 +1316,71 @@ class WeiBoClient(object):
             'headers': self.web_xhr_headers,
         }
     
+    @do_request(WEB_STOPIC_CHECKIN)
+    @web_cookie_required
+    def checkin_super_topic(self, topic_id) -> dict:
+        '''
+        【网页cookie版本】超话签到
+        :param topic_id: 超话id（可以是纯hex id或"1022:hex_id"格式），可以由接口fetch_super_topics获取超话信息
+        :return: 签到结果
+        '''
+        import time
+        from weibo.header import FakeChromeUA
+        
+        # Extract hex ID (remove "1022:" prefix if present)
+        hex_id = topic_id.split(':')[1] if ':' in str(topic_id) else topic_id
+        
+        return {
+            'params': {
+                'ajwvr': 6,
+                'api': 'http://i.huati.weibo.com/aj/super/checkin',
+                'texta': '签到',
+                'textb': '已签到',
+                'status': 0,
+                'id': hex_id,
+                'location': f'page_{hex_id[:6]}_super_index',
+                'timezone': 'GMT+0800',
+                'lang': 'zh-cn',
+                'plat': 'Win32',
+                'ua': FakeChromeUA.get_ua(),
+                'screen': '1920*1080',
+                '__rnd': int(time.time() * 1000),
+            },
+            'headers': self.web_xhr_headers,
+        }
+    
+    def checkin_super_topic_by_name(self, name: str) -> dict:
+        '''
+        【网页cookie版本】通过超话名称进行签到（自动搜索）
+        :param name: 超话名称
+        :return: 签到结果
+        '''
+        if not name or not str(name).strip():
+            return {'ok': 0, 'message': '请提供超话名称'}
+        
+        # Search for the topic
+        search_result = self.search_super_topics(keyword=name, page=1)
+        
+        if not search_result or not search_result.get('data') or len(search_result.get('data', [])) == 0:
+            return {'ok': 0, 'message': f'未找到超话: {name}'}
+        
+        # Get the first result
+        topic = search_result['data'][0]
+        topic_id = topic.get('id') or topic.get('oid')
+        
+        if not topic_id:
+            return {'ok': 0, 'message': '无法获取超话ID'}
+        
+        # Check in
+        checkin_result = self.checkin_super_topic(topic_id=topic_id)
+        
+        # Add topic info
+        if isinstance(checkin_result, dict):
+            checkin_result['topicName'] = topic.get('title')
+            checkin_result['topicId'] = topic_id
+        
+        return checkin_result
+    
     @do_request(WEB_UPDATE_TWEET, 'POST')
     @web_cookie_required
     def post_tweet(self,

@@ -169,6 +169,16 @@ export const OPERATIONS = [
     ],
   },
   {
+    id: 'checkin-super-topic-by-name',
+    label: '超话签到（按名称）',
+    group: '社交',
+    endpoint: '/api/checkin-super-topic-by-name',
+    method: 'POST',
+    fields: [
+      { name: 'name', label: '超话名称', type: 'text', required: true, placeholder: '输入超话名称进行签到' },
+    ],
+  },
+  {
     id: 'friends-tweets',
     label: '好友新微博',
     group: '获取',
@@ -223,7 +233,7 @@ export const BATCH_SUPPORTED_ENDPOINTS = new Set([
   '/api/post-tweet', '/api/delete-tweet', '/api/quick-repost', '/api/repost-tweet',
   '/api/comment-tweet', '/api/reply-comment', '/api/delete-comment', '/api/like-comment',
   '/api/follow-user', '/api/unfollow-user', '/api/like-tweet', '/api/unlike-tweet',
-  '/api/follow-super-topic', '/api/batch-like-comment-stream',
+  '/api/follow-super-topic', '/api/checkin-super-topic-by-name', '/api/batch-like-comment-stream',
 ]);
 
 export const SCHEDULABLE_OPERATIONS = OPERATIONS.filter(o => BATCH_SUPPORTED_ENDPOINTS.has(o.endpoint));
