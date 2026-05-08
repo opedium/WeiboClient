@@ -42,6 +42,11 @@ AUTH_REQUIRED="true"
 AUTH_TOKEN=""
 COOKIE_SECRET=""
 
+KEEP_ALIVE_INTERVAL_MS=86400000
+KEEP_ALIVE_FIRST_DELAY_MS=21600000
+
+
+
 # CORS allowlist (your production origins)
 # If empty, script auto-sets:
 # - DOMAIN set: https://DOMAIN,https://www.DOMAIN
