@@ -1859,7 +1859,8 @@ function OperationForm({ op, account, accountCount, accountNames }) {
       const data = await res.json();
       if (!data.ok) throw new Error(data.error ?? 'CAPTCHA 启动失败');
       
-      setCaptchaSession({ sessionId: data.sessionId, status: 'pending', error: null });
+      // Store isHeadless flag from response
+      setCaptchaSession({ sessionId: data.sessionId, status: 'pending', error: null, isHeadless: data.isHeadless, message: data.message });
       
       // Start polling
       if (captchaPollRef.current) clearInterval(captchaPollRef.current);
@@ -1874,13 +1875,13 @@ function OperationForm({ op, account, accountCount, accountNames }) {
           if (statusData.status === 'success') {
             clearInterval(captchaPollRef.current);
             captchaPollRef.current = null;
-            setCaptchaSession({ ...statusData, status: 'success' });
+            setCaptchaSession(s => ({ ...s, ...statusData, status: 'success' }));
             // Retry the operation
             setTimeout(() => handleSubmit({ preventDefault: () => {} }), 1000);
           } else if (['failed', 'cancelled', 'expired', 'timeout'].includes(statusData.status)) {
             clearInterval(captchaPollRef.current);
             captchaPollRef.current = null;
-            setCaptchaSession({ ...statusData, error: statusData.error ?? `验证 ${statusData.status}` });
+            setCaptchaSession(s => ({ ...s, ...statusData, error: statusData.error ?? `验证 ${statusData.status}` }));
           } else {
             setCaptchaSession(s => ({ ...s, status: statusData.status }));
           }
@@ -2275,23 +2276,42 @@ function OperationForm({ op, account, accountCount, accountNames }) {
             {captchaSession.status === 'pending' && (
               <>
                 <p style={{ margin: '0 0 12px 0', color: '#666', fontWeight: 500 }}>
-                  ⏳ 正在等待浏览器验证...
+                  {captchaSession.isHeadless ? '📱 需要手动验证' : '⏳ 正在等待浏览器验证...'}
                 </p>
                 <div style={{ backgroundColor: '#f9f9f9', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#666' }}>
-                  <p style={{ margin: '0 0 8px 0' }}>
-                    <strong>请注意：</strong>
-                  </p>
-                  <ol style={{ margin: '0', paddingLeft: 20 }}>
-                    <li>一个新的浏览器窗口即将打开（请检查任务栏或屏幕）</li>
-                    <li>如果看到验证码，请完成验证</li>
-                    <li>验证完成后，此页面将自动检测并重试操作</li>
-                    <li><strong>请勿</strong>关闭浏览器窗口直到显示成功</li>
-                    <li>整个过程最多等待15分钟</li>
-                  </ol>
+                  {captchaSession.isHeadless ? (
+                    <>
+                      <p style={{ margin: '0 0 8px 0' }}>
+                        <strong>⚠️ 后端运行在无显示服务器上，需要您手动验证：</strong>
+                      </p>
+                      <ol style={{ margin: '0', paddingLeft: 20 }}>
+                        <li>在您的电脑上打开浏览器，访问 <strong>weibo.com</strong></li>
+                        <li>如果出现验证码，请完成验证</li>
+                        <li>验证完成后，新的 Cookie 会被保存</li>
+                        <li>此页面会在检测到 Cookie 后自动重试操作</li>
+                        <li>整个过程最多等待15分钟</li>
+                      </ol>
+                    </>
+                  ) : (
+                    <>
+                      <p style={{ margin: '0 0 8px 0' }}>
+                        <strong>请注意：</strong>
+                      </p>
+                      <ol style={{ margin: '0', paddingLeft: 20 }}>
+                        <li>一个新的浏览器窗口即将打开（请检查任务栏或屏幕）</li>
+                        <li>如果看到验证码，请完成验证</li>
+                        <li>验证完成后，此页面将自动检测并重试操作</li>
+                        <li><strong>请勿</strong>关闭浏览器窗口直到显示成功</li>
+                        <li>整个过程最多等待15分钟</li>
+                      </ol>
+                    </>
+                  )}
                 </div>
                 <div style={{ textAlign: 'center', marginBottom: 16 }}>
                   <div style={{ fontSize: 20, color: '#0066cc' }}>⏳ 验证中...</div>
-                  <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>（请切换到浏览器窗口）</div>
+                  <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
+                    {captchaSession.isHeadless ? '（请在浏览器中完成验证）' : '（请切换到浏览器窗口）'}
+                  </div>
                 </div>
                 <button 
                   onClick={cancelCaptchaSession}

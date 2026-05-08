@@ -691,9 +691,12 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
   const proxyConfig = parsePlaywrightProxy(proxy);
   const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
 
-  // Launch browser normally (not persistent context for CAPTCHA verification)
+  // Detect if running on headless environment (Linux without DISPLAY)
+  const isHeadlessEnvironment = process.platform === 'linux' && !process.env.DISPLAY;
+  
+  // Launch browser (use headless on headless Linux, visible on Windows/Mac with display)
   const browser = await chromium.launch({
-    headless: false, // Open a visible browser window for user to interact with
+    headless: isHeadlessEnvironment ? true : false, // true on headless Linux, false on desktop
     proxy: proxyConfig || undefined,
   });
 
@@ -741,6 +744,7 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
       expiresAt: now + ttlMs,
       browser,
       context,
+      isHeadless: isHeadlessEnvironment,
       cookie: '',
       lastCookieStr: '',
       error: null,
@@ -751,13 +755,23 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
     captchaSessions.set(sessionId, session);
     void monitorCaptchaSession(sessionId);
 
+    // Different instructions based on environment
+    const message = isHeadlessEnvironment 
+      ? '在您的本地浏览器中手动完成验证（后端在监听）'
+      : '浏览器已打开。请在浏览器中解决 CAPTCHA 验证。';
+    
+    const instructions = isHeadlessEnvironment
+      ? '1. 在您的电脑上打开浏览器，访问微博\n2. 如果需要验证，请完成验证\n3. 验证后刷新此页面\n4. 后端将自动检测到新的 Cookie（需要 SUB + XSRF-TOKEN）'
+      : '1. 如果出现验证码，请完成验证。\n2. 完成后，此会话将自动检测到新的 Cookie。\n3. 请不要关闭浏览器，直到显示验证成功。';
+
     return {
       sessionId,
       accountIndex,
       accountName,
       status: 'pending',
-      message: '浏览器已打开。请在浏览器中解决 CAPTCHA 验证。',
-      instructions: '1. 如果出现验证码，请完成验证。\n2. 完成后，此会话将自动检测到新的 Cookie。\n3. 请不要关闭浏览器，直到显示验证成功。',
+      isHeadless: isHeadlessEnvironment,
+      message,
+      instructions,
       expiresAt: new Date(session.expiresAt).toISOString(),
     };
   } catch (error) {
