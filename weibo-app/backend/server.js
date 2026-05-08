@@ -766,6 +766,11 @@ app.post('/api/accounts/:index/captcha/start', async (req, res) => {
       maxWaitMs,
     });
 
+    // If headless environment, return error immediately
+    if (started.ok === 0 || started.requiresManualCookie) {
+      return res.status(400).json({ ok: false, error: started.error, isHeadless: started.isHeadless, requiresManualCookie: started.requiresManualCookie });
+    }
+
     return res.json({ ok: true, ...started });
   } catch (e) {
     const classified = classifyBackendError(e);

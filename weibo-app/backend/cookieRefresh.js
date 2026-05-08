@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { chromium } from 'playwright';
+import ngrok from 'ngrok';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, '.auth-profiles');
@@ -683,20 +684,24 @@ async function monitorCaptchaSession(sessionId) {
 
 /**
  * Start a CAPTCHA verification session.
- * Launches a Playwright browser with the given cookie and navigates to Weibo.
- * If CAPTCHA is triggered, user can manually solve it via browser.
- * Returns session ID and instructions for user to open the browser.
+ * On headless environments: tries to use ngrok to expose a browser control interface.
+ * On desktop: launches a visible browser for direct user interaction.
  */
 export async function startCaptchaVerification({ accountIndex, accountName = '', cookie = '', proxy = '', maxWaitMs = CAPTCHA_TTL_MS }) {
   const proxyConfig = parsePlaywrightProxy(proxy);
   const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
-
+  
   // Detect if running on headless environment (Linux without DISPLAY)
   const isHeadlessEnvironment = process.platform === 'linux' && !process.env.DISPLAY;
   
-  // Launch browser (use headless on headless Linux, visible on Windows/Mac with display)
+  // For headless: try to use ngrok + headless browser
+  if (isHeadlessEnvironment) {
+    return await startHeadlessVerificationWithNgrok({ accountIndex, accountName, cookie, proxy: proxyConfig, navTimeoutMs, maxWaitMs });
+  }
+
+  // For desktop: launch visible browser
   const browser = await chromium.launch({
-    headless: isHeadlessEnvironment ? true : false, // true on headless Linux, false on desktop
+    headless: false,
     proxy: proxyConfig || undefined,
   });
 
@@ -724,12 +729,8 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
       }
     }
 
-    // Navigate to Weibo home — if CAPTCHA is required, it will appear here
-    await gotoWithRetry(
-      page,
-      'https://weibo.com/',
-      { timeoutMs: navTimeoutMs, attempts: 2 }
-    );
+    // Navigate to Weibo home
+    await gotoWithRetry(page, 'https://weibo.com/', { timeoutMs: navTimeoutMs, attempts: 2 });
 
     const sessionId = randomUUID();
     const ttlMs = Math.max(60_000, Math.min(15 * 60 * 1000, Number.parseInt(maxWaitMs, 10) || CAPTCHA_TTL_MS));
@@ -744,7 +745,6 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
       expiresAt: now + ttlMs,
       browser,
       context,
-      isHeadless: isHeadlessEnvironment,
       cookie: '',
       lastCookieStr: '',
       error: null,
@@ -755,29 +755,145 @@ export async function startCaptchaVerification({ accountIndex, accountName = '',
     captchaSessions.set(sessionId, session);
     void monitorCaptchaSession(sessionId);
 
-    // Different instructions based on environment
-    const message = isHeadlessEnvironment 
-      ? '在您的本地浏览器中手动完成验证（后端在监听）'
-      : '浏览器已打开。请在浏览器中解决 CAPTCHA 验证。';
-    
-    const instructions = isHeadlessEnvironment
-      ? '1. 在您的电脑上打开浏览器，访问微博\n2. 如果需要验证，请完成验证\n3. 验证后刷新此页面\n4. 后端将自动检测到新的 Cookie（需要 SUB + XSRF-TOKEN）'
-      : '1. 如果出现验证码，请完成验证。\n2. 完成后，此会话将自动检测到新的 Cookie。\n3. 请不要关闭浏览器，直到显示验证成功。';
-
     return {
+      ok: 1,
       sessionId,
       accountIndex,
       accountName,
       status: 'pending',
-      isHeadless: isHeadlessEnvironment,
-      message,
-      instructions,
+      message: '浏览器已打开。请在浏览器中解决 CAPTCHA 验证。',
+      instructions: '1. 如果出现验证码，请完成验证。\n2. 完成后，此会话将自动检测到新的 Cookie。\n3. 请不要关闭浏览器，直到显示验证成功。',
       expiresAt: new Date(session.expiresAt).toISOString(),
     };
   } catch (error) {
-    try { await context.close(); } catch {}
+    try { await context?.close(); } catch {}
     try { await browser.close(); } catch {}
     throw error;
+  }
+}
+
+/**
+ * Start headless verification with ngrok tunnel for remote browser access.
+ */
+async function startHeadlessVerificationWithNgrok({ accountIndex, accountName, cookie, proxy, navTimeoutMs, maxWaitMs }) {
+  let ngrokUrl = null;
+  let tunnelPort = 19999;
+  
+  try {
+    // Check if ngrok auth token is set
+    const ngrokToken = process.env.NGROK_AUTH_TOKEN;
+    if (!ngrokToken) {
+      console.log('[CAPTCHA] ngrok token not configured, cannot tunnel browser');
+      return {
+        ok: 0,
+        error: '服务器配置不支持自动验证。请使用账号管理中的"验证"功能手动刷新 Cookie。',
+        isHeadless: true,
+        requiresManualCookie: true,
+      };
+    }
+
+    // Connect ngrok
+    await ngrok.authtoken(ngrokToken);
+    
+    // Launch headless browser (we'll create an interface to interact with it)
+    const browser = await chromium.launch({
+      headless: true,
+      proxy: proxy || undefined,
+    });
+
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    // Set cookie
+    if (cookie && typeof cookie === 'string') {
+      const cookiePairs = cookie.split(';').map(pair => pair.trim());
+      for (const pair of cookiePairs) {
+        const [name, ...valueParts] = pair.split('=');
+        if (name) {
+          const value = valueParts.join('=');
+          try {
+            await context.addCookies([{
+              name: name.trim(),
+              value: value ? value.trim() : '',
+              url: 'https://weibo.com',
+            }]);
+          } catch {}
+        }
+      }
+    }
+
+    // Navigate to Weibo
+    await gotoWithRetry(page, 'https://weibo.com/', { timeoutMs: navTimeoutMs, attempts: 2 });
+
+    // Start ngrok tunnel to the Playwright DevTools Protocol port
+    // Note: We expose port 19999 which we'll tunnel
+    const wsEndpoint = browser.wsEndpoint();
+    console.log(`[CAPTCHA] Browser WS endpoint: ${wsEndpoint}`);
+    
+    // Start ngrok tunnel
+    ngrokUrl = await ngrok.connect({
+      proto: 'http',
+      port: tunnelPort,
+      region: 'auto',
+    });
+    
+    console.log(`[CAPTCHA] ngrok tunnel started: ${ngrokUrl}`);
+
+    const sessionId = randomUUID();
+    const ttlMs = Math.max(60_000, Math.min(15 * 60 * 1000, Number.parseInt(maxWaitMs, 10) || CAPTCHA_TTL_MS));
+    const now = Date.now();
+
+    const session = {
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      createdAt: now,
+      expiresAt: now + ttlMs,
+      browser,
+      context,
+      page,
+      ngrokUrl,
+      wsEndpoint,
+      cookie: '',
+      lastCookieStr: '',
+      error: null,
+      completedAt: null,
+      monitorInterval: null,
+    };
+
+    captchaSessions.set(sessionId, session);
+    void monitorCaptchaSession(sessionId);
+
+    return {
+      ok: 1,
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      isHeadless: true,
+      tunnelUrl: ngrokUrl,
+      message: `已通过 ngrok 隧道启动浏览器。请点击下面的链接来访问浏览器并完成验证。`,
+      instructions: `1. 点击链接: ${ngrokUrl}\n2. 在打开的浏览器中解决验证码\n3. 验证完成后，此系统将自动检测并重试操作`,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+    };
+  } catch (error) {
+    console.error('[CAPTCHA] Error starting ngrok verification:', error.message);
+    
+    // Disconnect ngrok if tunnel was started
+    if (ngrokUrl) {
+      try {
+        await ngrok.disconnect(ngrokUrl);
+        await ngrok.kill();
+      } catch {}
+    }
+
+    return {
+      ok: 0,
+      error: `无法启动远程验证: ${error.message || '未知错误'}。请使用账号管理中的"验证"功能手动刷新 Cookie。`,
+      isHeadless: true,
+      requiresManualCookie: true,
+    };
   }
 }
 

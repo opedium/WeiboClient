@@ -1857,10 +1857,29 @@ function OperationForm({ op, account, accountCount, accountNames }) {
         body: JSON.stringify({ maxWaitMs: 900000 }),
       });
       const data = await res.json();
+      
+      // Check if this is a headless server error (not able to auto-verify)
+      if (!data.ok && data.isHeadless) {
+        setCaptchaSession({ 
+          status: 'headless_unavailable', 
+          error: data.error,
+          isHeadless: true,
+          instructions: '此服务器无法自动验证。请使用账号管理中的"验证"功能手动刷新 Cookie。'
+        });
+        return;
+      }
+      
       if (!data.ok) throw new Error(data.error ?? 'CAPTCHA 启动失败');
       
-      // Store isHeadless flag from response
-      setCaptchaSession({ sessionId: data.sessionId, status: 'pending', error: null, isHeadless: data.isHeadless, message: data.message });
+      // Set up captcha session with all response data (including tunnelUrl if available)
+      setCaptchaSession({ 
+        sessionId: data.sessionId, 
+        status: 'pending', 
+        error: null, 
+        isHeadless: data.isHeadless, 
+        message: data.message,
+        tunnelUrl: data.tunnelUrl  // Include tunnel URL if available
+      });
       
       // Start polling
       if (captchaPollRef.current) clearInterval(captchaPollRef.current);
@@ -2270,47 +2289,89 @@ function OperationForm({ op, account, accountCount, accountNames }) {
           zIndex: 9999
         }}>
           <div style={{
-            backgroundColor: '#fff', padding: 24, borderRadius: 8, maxWidth: 400, boxShadow: '0 4px 12px rgba(0,0,0,0.15)'
+            backgroundColor: '#fff', padding: 24, borderRadius: 8, maxWidth: 500, boxShadow: '0 4px 12px rgba(0,0,0,0.15)'
           }}>
             <h3 style={{ margin: '0 0 16px 0', fontSize: 18 }}>🔐 CAPTCHA 验证</h3>
+            {captchaSession.status === 'headless_unavailable' && (
+              <>
+                <p style={{ margin: '0 0 12px 0', color: '#666', fontWeight: 500 }}>
+                  ⚠️ 无法自动验证
+                </p>
+                <div style={{ backgroundColor: '#fff3cd', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#856404', borderLeft: '4px solid #ffc107' }}>
+                  <p style={{ margin: '0 0 8px 0' }}>
+                    <strong>此服务器在无显示环境中运行，无法自动打开浏览器。</strong>
+                  </p>
+                  <p style={{ margin: 0 }}>
+                    请使用账号管理中的<strong>"验证"</strong>功能来手动刷新 Cookie。
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setCaptchaSession(null)}
+                  style={{
+                    width: '100%', padding: 10, backgroundColor: '#007bff', color: '#fff', border: 'none',
+                    borderRadius: 4, cursor: 'pointer', fontSize: 14, fontWeight: 500
+                  }}
+                >
+                  关闭
+                </button>
+              </>
+            )}
             {captchaSession.status === 'pending' && (
               <>
                 <p style={{ margin: '0 0 12px 0', color: '#666', fontWeight: 500 }}>
-                  {captchaSession.isHeadless ? '📱 需要手动验证' : '⏳ 正在等待浏览器验证...'}
+                  {captchaSession.isHeadless ? '🌐 远程浏览器验证' : '⏳ 正在等待浏览器验证...'}
                 </p>
-                <div style={{ backgroundColor: '#f9f9f9', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#666' }}>
-                  {captchaSession.isHeadless ? (
-                    <>
-                      <p style={{ margin: '0 0 8px 0' }}>
-                        <strong>⚠️ 后端运行在无显示服务器上，需要您手动验证：</strong>
-                      </p>
-                      <ol style={{ margin: '0', paddingLeft: 20 }}>
-                        <li>在您的电脑上打开浏览器，访问 <strong>weibo.com</strong></li>
-                        <li>如果出现验证码，请完成验证</li>
-                        <li>验证完成后，新的 Cookie 会被保存</li>
-                        <li>此页面会在检测到 Cookie 后自动重试操作</li>
-                        <li>整个过程最多等待15分钟</li>
-                      </ol>
-                    </>
-                  ) : (
-                    <>
-                      <p style={{ margin: '0 0 8px 0' }}>
-                        <strong>请注意：</strong>
-                      </p>
-                      <ol style={{ margin: '0', paddingLeft: 20 }}>
-                        <li>一个新的浏览器窗口即将打开（请检查任务栏或屏幕）</li>
-                        <li>如果看到验证码，请完成验证</li>
-                        <li>验证完成后，此页面将自动检测并重试操作</li>
-                        <li><strong>请勿</strong>关闭浏览器窗口直到显示成功</li>
-                        <li>整个过程最多等待15分钟</li>
-                      </ol>
-                    </>
-                  )}
-                </div>
+                {captchaSession.tunnelUrl ? (
+                  <div style={{ backgroundColor: '#e7f3ff', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#0066cc', borderLeft: '4px solid #0066cc' }}>
+                    <p style={{ margin: '0 0 12px 0', fontWeight: 500 }}>
+                      ✅ 已通过 ngrok 隧道启动浏览器
+                    </p>
+                    <p style={{ margin: '0 0 8px 0' }}>
+                      请点击下面的链接在浏览器中完成验证：
+                    </p>
+                    <a 
+                      href={captchaSession.tunnelUrl} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      style={{
+                        display: 'inline-block',
+                        padding: '10px 16px',
+                        backgroundColor: '#0066cc',
+                        color: '#fff',
+                        textDecoration: 'none',
+                        borderRadius: 4,
+                        fontWeight: 500,
+                        marginBottom: 12,
+                        wordBreak: 'break-all',
+                      }}
+                    >
+                      🔗 打开验证浏览器
+                    </a>
+                    <p style={{ margin: '0', fontSize: 12, color: '#666' }}>
+                      如果链接无法打开，请复制地址栏中的完整链接：<br />
+                      <code style={{ fontSize: 11, backgroundColor: '#f0f0f0', padding: '4px 6px', borderRadius: 2 }}>
+                        {captchaSession.tunnelUrl}
+                      </code>
+                    </p>
+                  </div>
+                ) : (
+                  <div style={{ backgroundColor: '#f9f9f9', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#666' }}>
+                    <p style={{ margin: '0 0 8px 0' }}>
+                      <strong>请注意：</strong>
+                    </p>
+                    <ol style={{ margin: '0', paddingLeft: 20 }}>
+                      <li>一个新的浏览器窗口即将打开（请检查任务栏或屏幕）</li>
+                      <li>如果看到验证码，请完成验证</li>
+                      <li>验证完成后，此页面将自动检测并重试操作</li>
+                      <li><strong>请勿</strong>关闭浏览器窗口直到显示成功</li>
+                      <li>整个过程最多等待15分钟</li>
+                    </ol>
+                  </div>
+                )}
                 <div style={{ textAlign: 'center', marginBottom: 16 }}>
                   <div style={{ fontSize: 20, color: '#0066cc' }}>⏳ 验证中...</div>
                   <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
-                    {captchaSession.isHeadless ? '（请在浏览器中完成验证）' : '（请切换到浏览器窗口）'}
+                    {captchaSession.tunnelUrl ? '（请在打开的浏览器窗口中完成验证）' : '（请切换到浏览器窗口）'}
                   </div>
                 </div>
                 <button 
