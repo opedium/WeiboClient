@@ -1788,7 +1788,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   const [batchResults, setBatchResults] = useState(null);   // array of completed results
   const [batchStatus, setBatchStatus] = useState(null);     // { current, total, waiting, remaining }
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState(null);                  // now stores full error object: {message, error_code, ...}
   const [batchMode, setBatchMode] = useState(false);
   const [selectedAccounts, setSelectedAccounts] = useState(null); // null = all
   const [delay, setDelay] = useState(3000);
@@ -1798,6 +1798,8 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   const [useRandom, setUseRandom] = useState(false);
   const [randomGroup, setRandomGroup] = useState('');
   const [copyGroups, setCopyGroups] = useState([]);
+  const [captchaSession, setCaptchaSession] = useState(null); // {sessionId, status, error}
+  const captchaPollRef = useRef(null);
 
   const canBatch = accountCount > 1 && BATCH_SUPPORTED.has(op.endpoint);
   const canLoopBatch = LOOPABLE_BATCH_ENDPOINTS.has(op.endpoint);
@@ -1813,6 +1815,16 @@ function OperationForm({ op, account, accountCount, accountNames }) {
     }
   }, [useRandom]);
 
+  // cleanup captcha poll on unmount
+  useEffect(() => {
+    return () => {
+      if (captchaPollRef.current) {
+        clearInterval(captchaPollRef.current);
+        captchaPollRef.current = null;
+      }
+    };
+  }, []);
+
   // reset when operation changes
   useEffect(() => {
     setValues(initialValuesFromFields(op.fields));
@@ -1826,9 +1838,76 @@ function OperationForm({ op, account, accountCount, accountNames }) {
     setRoundDelay(3000);
     setUseRandom(false);
     setRandomGroup('');
+    setCaptchaSession(null);
+    if (captchaPollRef.current) {
+      clearInterval(captchaPollRef.current);
+      captchaPollRef.current = null;
+    }
   }, [op.id, op.fields, initialValuesFromFields]);
 
   const handleChange = (name, value) => setValues(v => ({ ...v, [name]: value }));
+
+  const startCaptchaVerification = async () => {
+    if (!error?.error_code || error.error_code !== 20067) return;
+    setCaptchaSession({ sessionId: null, status: 'starting', error: null });
+    try {
+      const res = await fetch(`${API}/api/accounts/${account}/captcha/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+        body: JSON.stringify({ maxWaitMs: 900000 }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error ?? 'CAPTCHA 启动失败');
+      
+      setCaptchaSession({ sessionId: data.sessionId, status: 'pending', error: null });
+      
+      // Start polling
+      if (captchaPollRef.current) clearInterval(captchaPollRef.current);
+      captchaPollRef.current = setInterval(async () => {
+        try {
+          const statusRes = await fetch(
+            `${API}/api/accounts/${account}/captcha/status?sessionId=${encodeURIComponent(data.sessionId)}`,
+            { headers: { 'x-auth-token': getToken() } }
+          );
+          const statusData = await statusRes.json();
+          
+          if (statusData.status === 'success') {
+            clearInterval(captchaPollRef.current);
+            captchaPollRef.current = null;
+            setCaptchaSession({ ...statusData, status: 'success' });
+            // Retry the operation
+            setTimeout(() => handleSubmit({ preventDefault: () => {} }), 1000);
+          } else if (['failed', 'cancelled', 'expired', 'timeout'].includes(statusData.status)) {
+            clearInterval(captchaPollRef.current);
+            captchaPollRef.current = null;
+            setCaptchaSession({ ...statusData, error: statusData.error ?? `验证 ${statusData.status}` });
+          } else {
+            setCaptchaSession(s => ({ ...s, status: statusData.status }));
+          }
+        } catch (err) {
+          setCaptchaSession(s => ({ ...s, error: err.message }));
+        }
+      }, 2000);
+    } catch (err) {
+      setCaptchaSession({ sessionId: null, status: 'failed', error: err.message });
+    }
+  };
+
+  const cancelCaptchaSession = async () => {
+    if (!captchaSession?.sessionId) return;
+    if (captchaPollRef.current) {
+      clearInterval(captchaPollRef.current);
+      captchaPollRef.current = null;
+    }
+    try {
+      await fetch(`${API}/api/accounts/${account}/captcha/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+        body: JSON.stringify({ sessionId: captchaSession.sessionId }),
+      });
+    } catch {}
+    setCaptchaSession(null);
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -1953,11 +2032,18 @@ function OperationForm({ op, account, accountCount, accountNames }) {
           ? { ...values, useRandom: true, randomField: 'content', randomGroup: randomGroup || null }
           : values;
         const data = await callApi(op, body, account);
-        if (data.ok) setResult(data.data);
-        else setError(data.error ?? '请求失败');
+        if (data.ok === 1) {
+          setResult(data.data);
+        } else if (data.data && typeof data.data === 'object' && data.data.ok === 0) {
+          // Error is nested inside data.data (e.g., {ok: true, data: {ok: 0, error_code: 20067, ...}})
+          setError(data.data);
+        } else {
+          // ok !== 1 means error — store full response so we can check error_code
+          setError(data);
+        }
       }
     } catch (err) {
-      setError(err.message);
+      setError({ message: err.message });
     } finally {
       setLoading(false);
     }
@@ -2148,13 +2234,121 @@ function OperationForm({ op, account, accountCount, accountNames }) {
       {error && (
         <div className="result error">
           <span className="tag err">✗ 错误</span>
-          <PrettyResponse value={error} opId={op.id} />
+          <PrettyResponse value={error.message ?? error.error ?? error} opId={op.id} />
+          {error.error_code === 20067 && (
+            <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid rgba(255,68,85,0.2)', display: 'flex', gap: 8 }}>
+              <button 
+                className="btn-submit" 
+                onClick={() => {
+                  console.log('Starting CAPTCHA verification for error:', error);
+                  startCaptchaVerification();
+                }}
+                disabled={captchaSession?.status === 'pending'}
+                style={{ 
+                  padding: '8px 16px',
+                  backgroundColor: captchaSession?.status === 'pending' ? '#999' : '#ff4455',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 4,
+                  cursor: captchaSession?.status === 'pending' ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                  fontWeight: 500
+                }}
+              >
+                {captchaSession?.status === 'pending' ? '⏳ 验证中...' : '🔄 解决 CAPTCHA'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {captchaSession && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 9999
+        }}>
+          <div style={{
+            backgroundColor: '#fff', padding: 24, borderRadius: 8, maxWidth: 400, boxShadow: '0 4px 12px rgba(0,0,0,0.15)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', fontSize: 18 }}>🔐 CAPTCHA 验证</h3>
+            {captchaSession.status === 'pending' && (
+              <>
+                <p style={{ margin: '0 0 12px 0', color: '#666', fontWeight: 500 }}>
+                  ⏳ 正在等待浏览器验证...
+                </p>
+                <div style={{ backgroundColor: '#f9f9f9', padding: 12, borderRadius: 4, marginBottom: 16, fontSize: 13, color: '#666' }}>
+                  <p style={{ margin: '0 0 8px 0' }}>
+                    <strong>请注意：</strong>
+                  </p>
+                  <ol style={{ margin: '0', paddingLeft: 20 }}>
+                    <li>一个新的浏览器窗口即将打开（请检查任务栏或屏幕）</li>
+                    <li>如果看到验证码，请完成验证</li>
+                    <li>验证完成后，此页面将自动检测并重试操作</li>
+                    <li><strong>请勿</strong>关闭浏览器窗口直到显示成功</li>
+                    <li>整个过程最多等待15分钟</li>
+                  </ol>
+                </div>
+                <div style={{ textAlign: 'center', marginBottom: 16 }}>
+                  <div style={{ fontSize: 20, color: '#0066cc' }}>⏳ 验证中...</div>
+                  <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>（请切换到浏览器窗口）</div>
+                </div>
+                <button 
+                  onClick={cancelCaptchaSession}
+                  style={{
+                    width: '100%', padding: 10, backgroundColor: '#f0f0f0', border: '1px solid #ccc',
+                    borderRadius: 4, cursor: 'pointer', fontSize: 14, fontWeight: 500
+                  }}
+                >
+                  取消验证
+                </button>
+              </>
+            )}
+            {captchaSession.status === 'success' && (
+              <>
+                <p style={{ margin: 0, color: '#0c0' }}>✓ CAPTCHA 验证成功！</p>
+                <p style={{ margin: '8px 0 0 0', color: '#666', fontSize: 13 }}>正在重试操作...</p>
+              </>
+            )}
+            {['failed', 'cancelled', 'expired', 'timeout'].includes(captchaSession.status) && (
+              <>
+                <p style={{ margin: '0 0 8px 0', color: '#c00' }}>✗ 验证失败</p>
+                <p style={{ margin: '0 0 16px 0', color: '#666', fontSize: 13 }}>
+                  {captchaSession.error ?? `验证状态: ${captchaSession.status}`}
+                </p>
+                <button 
+                  onClick={() => {
+                    setCaptchaSession(null);
+                    setError(null);
+                  }}
+                  style={{
+                    width: '100%', padding: 8, backgroundColor: '#f0f0f0', border: '1px solid #ccc',
+                    borderRadius: 4, cursor: 'pointer', fontSize: 14
+                  }}
+                >
+                  关闭
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
       {result !== null && (
         <div className="result success">
           <span className="tag ok">✓ 成功</span>
           <PrettyResponse value={result} opId={op.id} />
+          {(result?.error_code === 20067 || result?.validate?.alitest === 1) && (
+            <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+              <button 
+                className="btn-submit" 
+                onClick={startCaptchaVerification}
+                disabled={captchaSession?.status === 'pending'}
+                style={{ backgroundColor: captchaSession?.status === 'pending' ? '#999' : undefined }}
+              >
+                {captchaSession?.status === 'pending' ? '🔄 验证中...' : '🔄 解决 CAPTCHA'}
+              </button>
+            </div>
+          )}
         </div>
       )}
       {batchStatus && (

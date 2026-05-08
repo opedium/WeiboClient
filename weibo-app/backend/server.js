@@ -19,6 +19,9 @@ import {
   startQrLoginSession,
   getQrLoginStatus,
   cancelQrLoginSession,
+  startCaptchaVerification,
+  getCaptchaStatus,
+  cancelCaptchaSession,
 } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
@@ -733,6 +736,133 @@ app.post('/api/accounts/:index/qr-login/cancel', async (req, res) => {
   const result = await cancelQrLoginSession(sessionId);
   refreshLocks.delete(idx);
   activeQrSessionByAccount.delete(idx);
+  return res.json({ ok: true, ...result });
+});
+
+// ── CAPTCHA Verification ─────────────────────────────────
+app.post('/api/accounts/:index/captcha/start', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    const account = accounts[idx];
+    if (!account?.cookie) {
+      return res.status(400).json({ ok: false, error: `账号 ${idx + 1} 没有 Cookie` });
+    }
+
+    const maxWaitMs = Math.min(15 * 60 * 1000, Math.max(60 * 1000, Number.parseInt(req.body?.maxWaitMs ?? 900000, 10) || 900000));
+    const started = await startCaptchaVerification({
+      accountIndex: idx,
+      accountName: account.name ?? '',
+      cookie: account.cookie,
+      proxy: account.proxy ?? '',
+      maxWaitMs,
+    });
+
+    return res.json({ ok: true, ...started });
+  } catch (e) {
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  }
+});
+
+app.get('/api/accounts/:index/captcha/status', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  const sessionId = String(req.query.sessionId ?? '').trim();
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: '缺少 sessionId' });
+  }
+
+  const status = getCaptchaStatus(sessionId);
+  if (!status.found) {
+    return res.status(404).json({ ok: false, error: status.error ?? '会话不存在', status: status.status });
+  }
+
+  if (status.accountIndex !== idx) {
+    return res.status(400).json({ ok: false, error: '会话与账号索引不匹配' });
+  }
+
+  // If still pending, just return the status
+  if (status.status === 'pending') {
+    return res.json({ ok: true, ...status });
+  }
+
+  // If failed, expired, cancelled, or timeout, return the error
+  if (status.status !== 'success') {
+    return res.json({ ok: true, ...status });
+  }
+
+  // If success, validate and save the cookie
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    const refreshedCookie = String(status.cookie ?? '').trim();
+    const check = checkCookieFields(refreshedCookie);
+    if (check.missing.length) {
+      return res.status(400).json({ ok: false, error: `验证完成但 Cookie 缺少字段: ${check.missing.join(', ')}`, missing: check.missing });
+    }
+
+    let live = { valid: false, uid: null, name: null, avatar: null, reason: '未校验' };
+    try {
+      live = await validateCookieLive(refreshedCookie, accounts[idx]?.proxy ?? '');
+    } catch (e) {
+      live = { valid: false, uid: null, name: null, avatar: null, reason: `验证后校验失败: ${e.message}` };
+    }
+
+    const updated = accounts.map((a, i) => (i === idx ? {
+      ...a,
+      cookie: refreshedCookie,
+      uid: live.valid && live.uid ? String(live.uid) : String(a.uid ?? '').trim(),
+    } : a));
+    await setAccounts(updated);
+    const clean = sanitizeAccountsForResponse(updated);
+
+    return res.json({
+      ok: true,
+      ...status,
+      account: clean[idx],
+      validated: {
+        valid: !!live.valid,
+        uid: live.uid,
+        name: live.name,
+        avatar: live.avatar,
+        error: live.valid ? null : live.reason,
+        missingRec: check.missingRec,
+      },
+      message: 'CAPTCHA 已验证，Cookie 已保存',
+    });
+  } catch (e) {
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  }
+});
+
+app.post('/api/accounts/:index/captcha/cancel', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  const sessionId = String(req.body?.sessionId ?? '').trim();
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: '缺少 sessionId' });
+  }
+
+  const result = await cancelCaptchaSession(sessionId);
   return res.json({ ok: true, ...result });
 });
 

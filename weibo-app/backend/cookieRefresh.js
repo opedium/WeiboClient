@@ -9,7 +9,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, '.auth-profiles');
 const COOKIE_REFRESH_MODE = String(process.env.COOKIE_REFRESH_MODE ?? 'auto').trim().toLowerCase();
 const QR_LOGIN_TTL_MS = Math.max(60_000, Number.parseInt(process.env.QR_LOGIN_TTL_MS ?? '180000', 10) || 180_000);
+const CAPTCHA_TTL_MS = Math.max(60_000, Number.parseInt(process.env.CAPTCHA_TTL_MS ?? '900000', 10) || 900_000);
 const qrSessions = new Map();
+const captchaSessions = new Map();
 
 function canOpenVisibleBrowser() {
   if (COOKIE_REFRESH_MODE === 'headless') return false;
@@ -554,6 +556,247 @@ export async function resetBrowserProfile({ accountIndex, accountName = '' }) {
     return { reset: false, userDataDir, error: '浏览器进程可能仍在运行，无法删除配置文件。请稍候重试。' };
   }
   return { reset: true, userDataDir };
+}
+
+// ── CAPTCHA Verification Session ──────────────────────────────
+
+function getCaptchaSession(sessionId) {
+  const session = captchaSessions.get(sessionId);
+  if (!session) return null;
+  const terminal = ['success', 'failed', 'cancelled', 'expired'];
+  if (terminal.includes(session.status)) {
+    const terminalAt = session.completedAt ? Date.parse(session.completedAt) : session.createdAt;
+    if (Number.isFinite(terminalAt) && Date.now() - terminalAt > 5 * 60 * 1000) {
+      captchaSessions.delete(sessionId);
+      return null;
+    }
+  }
+  if (Date.now() > session.expiresAt && !['success', 'failed', 'cancelled', 'expired'].includes(session.status)) {
+    session.status = 'expired';
+    session.error = 'CAPTCHA 验证会话已过期，请重新获取';
+    session.completedAt = new Date().toISOString();
+    void closeCaptchaSessionContext(sessionId);
+  }
+  return session;
+}
+
+async function closeCaptchaSessionContext(sessionId) {
+  const session = captchaSessions.get(sessionId);
+  if (!session) return;
+  if (session.context) {
+    try { await session.context.close(); } catch {}
+    session.context = null;
+  }
+  if (session.browser) {
+    try { await session.browser.close(); } catch {}
+    session.browser = null;
+  }
+  if (session.monitorInterval) {
+    clearInterval(session.monitorInterval);
+    session.monitorInterval = null;
+  }
+}
+
+async function monitorCaptchaSession(sessionId) {
+  const session = captchaSessions.get(sessionId);
+  if (!session) return;
+  const { context } = session;
+
+  try {
+    let consecutiveEmpty = 0;
+    const maxEmpty = 300; // 300 checks = ~10 minutes of no cookie activity (give user plenty of time)
+    let checkCount = 0;
+
+    while (true) {
+      checkCount++;
+      const s = captchaSessions.get(sessionId);
+      if (!s) return;
+      if (s.status === 'cancelled') return;
+      if (Date.now() > s.expiresAt) {
+        s.status = 'expired';
+        s.error = 'CAPTCHA 验证会话已过期（超过15分钟）';
+        s.completedAt = new Date().toISOString();
+        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... expired after ${checkCount * 2}s`);
+        await closeCaptchaSessionContext(sessionId);
+        return;
+      }
+
+      // Check if cookies have been updated (user completed CAPTCHA or login)
+      // Try multiple domain options since cookies might be on any Weibo domain
+      let cookies = await context.cookies(['https://weibo.com', 'https://www.weibo.com']);
+      if (!cookies || cookies.length === 0) {
+        cookies = await context.cookies(); // Get all cookies if specific domain didn't work
+      }
+      const cookieStr = toCookieString(cookies);
+      
+      // Also check for verification success indicators
+      // Sometimes after CAPTCHA is solved, we might see other cookies or page state changes
+      const allCookies = await context.cookies();
+      const hasAnySessionIndicators = allCookies.length > 3; // More than just basic cookies
+
+      // Debug: log cookies detected
+      const hasSub = hasCookieField(cookieStr, 'SUB');
+      const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+      if (checkCount % 10 === 1) { // Log every ~20 seconds
+        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... check #${checkCount}: SUB=${hasSub}, XSRF-TOKEN=${hasXsrf}, cookies=${cookieStr.split(';').length} items`);
+      }
+
+      // If session cookies are present, assume CAPTCHA was solved
+      if (hasRequiredSessionCookies(cookieStr)) {
+        s.status = 'success';
+        s.cookie = cookieStr;
+        s.completedAt = new Date().toISOString();
+        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... SUCCESS! Required cookies detected after ${checkCount * 2}s`);
+        await closeCaptchaSessionContext(sessionId);
+        return;
+      }
+
+      // Count consecutive empty/no-change periods
+      if (s.lastCookieStr && s.lastCookieStr === cookieStr) {
+        consecutiveEmpty++;
+      } else {
+        consecutiveEmpty = 0;
+        s.lastCookieStr = cookieStr;
+      }
+
+      // If cookies haven't changed for too long, give up
+      if (consecutiveEmpty > maxEmpty) {
+        s.status = 'timeout';
+        s.error = `CAPTCHA 验证超时：${checkCount * 2}秒内未检测到验证成功。请检查浏览器是否正常显示，或手动完成验证后刷新页面。`;
+        s.completedAt = new Date().toISOString();
+        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... TIMEOUT after ${checkCount * 2}s (no cookie changes for ${consecutiveEmpty * 2}s)`);
+        await closeCaptchaSessionContext(sessionId);
+        return;
+      }
+
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (error) {
+    const s = captchaSessions.get(sessionId);
+    if (!s) return;
+    s.status = 'failed';
+    s.error = String(error?.message ?? error);
+    s.completedAt = new Date().toISOString();
+    await closeCaptchaSessionContext(sessionId);
+  }
+}
+
+/**
+ * Start a CAPTCHA verification session.
+ * Launches a Playwright browser with the given cookie and navigates to Weibo.
+ * If CAPTCHA is triggered, user can manually solve it via browser.
+ * Returns session ID and instructions for user to open the browser.
+ */
+export async function startCaptchaVerification({ accountIndex, accountName = '', cookie = '', proxy = '', maxWaitMs = CAPTCHA_TTL_MS }) {
+  const proxyConfig = parsePlaywrightProxy(proxy);
+  const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+
+  // Launch browser normally (not persistent context for CAPTCHA verification)
+  const browser = await chromium.launch({
+    headless: false, // Open a visible browser window for user to interact with
+    proxy: proxyConfig || undefined,
+  });
+
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    // Set the cookie before navigating
+    if (cookie && typeof cookie === 'string') {
+      const cookiePairs = cookie.split(';').map(pair => pair.trim());
+      for (const pair of cookiePairs) {
+        const [name, ...valueParts] = pair.split('=');
+        if (name) {
+          const value = valueParts.join('=');
+          try {
+            await context.addCookies([{
+              name: name.trim(),
+              value: value ? value.trim() : '',
+              url: 'https://weibo.com',
+            }]);
+          } catch {
+            // Cookie might not be settable, continue
+          }
+        }
+      }
+    }
+
+    // Navigate to Weibo home — if CAPTCHA is required, it will appear here
+    await gotoWithRetry(
+      page,
+      'https://weibo.com/',
+      { timeoutMs: navTimeoutMs, attempts: 2 }
+    );
+
+    const sessionId = randomUUID();
+    const ttlMs = Math.max(60_000, Math.min(15 * 60 * 1000, Number.parseInt(maxWaitMs, 10) || CAPTCHA_TTL_MS));
+    const now = Date.now();
+
+    const session = {
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      createdAt: now,
+      expiresAt: now + ttlMs,
+      browser,
+      context,
+      cookie: '',
+      lastCookieStr: '',
+      error: null,
+      completedAt: null,
+      monitorInterval: null,
+    };
+
+    captchaSessions.set(sessionId, session);
+    void monitorCaptchaSession(sessionId);
+
+    return {
+      sessionId,
+      accountIndex,
+      accountName,
+      status: 'pending',
+      message: '浏览器已打开。请在浏览器中解决 CAPTCHA 验证。',
+      instructions: '1. 如果出现验证码，请完成验证。\n2. 完成后，此会话将自动检测到新的 Cookie。\n3. 请不要关闭浏览器，直到显示验证成功。',
+      expiresAt: new Date(session.expiresAt).toISOString(),
+    };
+  } catch (error) {
+    try { await context.close(); } catch {}
+    try { await browser.close(); } catch {}
+    throw error;
+  }
+}
+
+export function getCaptchaStatus(sessionId) {
+  const session = getCaptchaSession(sessionId);
+  if (!session) {
+    return { found: false, status: 'not_found', error: 'CAPTCHA 会话不存在或已结束' };
+  }
+
+  return {
+    found: true,
+    sessionId,
+    accountIndex: session.accountIndex,
+    accountName: session.accountName,
+    status: session.status,
+    error: session.error,
+    expiresAt: new Date(session.expiresAt).toISOString(),
+    completedAt: session.completedAt,
+    cookie: session.status === 'success' ? session.cookie : '',
+  };
+}
+
+export async function cancelCaptchaSession(sessionId) {
+  const session = captchaSessions.get(sessionId);
+  if (!session) {
+    return { ok: false, status: 'not_found' };
+  }
+  session.status = 'cancelled';
+  session.error = '已取消';
+  session.completedAt = new Date().toISOString();
+  await closeCaptchaSessionContext(sessionId);
+  captchaSessions.delete(sessionId);
+  return { ok: true, status: 'cancelled' };
 }
 
 /**
