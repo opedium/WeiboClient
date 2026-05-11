@@ -139,6 +139,14 @@ function sanitizeAccountsForResponse(accounts) {
   }));
 }
 
+// ── Validate Weibo API response ──────────────────────────────────────────────
+function validateWeiboResponse(data) {
+  if (!data || typeof data !== 'object') return { ok: false, error: '错误' };
+  const okValue = data.ok;
+  if (okValue !== 1 && okValue !== true) return { ok: false, error: '错误' };
+  return { ok: true, data };
+}
+
 // ── Wrapped handler (Weibo API with account resolution + random content) ───
 async function runWrapped(req, res, fn) {
   const body = getBody(req);
@@ -155,7 +163,9 @@ async function runWrapped(req, res, fn) {
       if (picked) resolvedBody = { ...body, [body.randomField]: picked };
     }
     const data = await fn(client, resolvedBody, getQueryParams(req));
-    return res.json({ ok: true, data });
+    const validated = validateWeiboResponse(data);
+    if (!validated.ok) return res.json(validated);
+    return res.json({ ok: true, data: validated.data });
   } catch (err) {
     return res.json({ ok: false, error: err.message }, 500);
   }
@@ -353,7 +363,12 @@ export default async ({ req, res, log, error }) => {
               if (picked) { resolved = { ...resolved, [params.randomField]: picked }; pickedContent = picked; }
             }
             const data = await handler(client, resolved);
-            results.push({ account: i + 1, loop: loop + 1, totalRounds, ok: true, data, pickedContent });
+            const validated = validateWeiboResponse(data);
+            if (!validated.ok) {
+              results.push({ account: i + 1, loop: loop + 1, totalRounds, ok: false, error: '错误' });
+            } else {
+              results.push({ account: i + 1, loop: loop + 1, totalRounds, ok: true, data: validated.data, pickedContent });
+            }
           } catch (err) {
             results.push({ account: i + 1, loop: loop + 1, totalRounds, ok: false, error: err.message });
           }
