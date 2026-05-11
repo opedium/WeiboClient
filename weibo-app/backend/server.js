@@ -930,42 +930,85 @@ app.get('/api/accounts/:index/open-weibo', async (req, res) => {
       return res.status(400).json({ ok: false, error: '该账户还没有 Cookie' });
     }
 
-    // Parse and set individual cookies, then redirect
-    // Note: This method returns HTML that manually sets cookies and redirects
-    const cookiePairs = cookieStr.split(';').map(c => c.trim()).filter(Boolean);
-    
-    const setCookieHeader = cookiePairs.map(pair => {
-      const [name, ...valueParts] = pair.split('=');
-      const cookieName = name.trim();
-      const cookieValue = valueParts.join('=').trim();
-      if (!cookieName || !cookieValue) return null;
-      // Set for root path, allow cross-site (SameSite=None requires Secure)
-      return `${cookieName}=${cookieValue}; Max-Age=604800; Path=/; SameSite=None; Secure`;
-    }).filter(Boolean);
+    console.log(`[open-weibo] fetching weibo.com for account ${idx}`);
 
-    // Return HTML that redirects with a meta refresh
-    // Cookies won't persist to weibo.com domain due to browser SOP, so we just proxy
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    // Fetch weibo.com with cookies injected in request
+    // Use more comprehensive headers to mimic real browser
+    const headers = {
+      'Cookie': cookieStr,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'max-age=0',
+      'Sec-Ch-Ua': '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Upgrade-Insecure-Requests': '1',
+      'Dnt': '1',
+      'Connection': 'keep-alive',
+      'Pragma': 'no-cache',
+    };
+
+    console.log(`[open-weibo] sending request with headers...`);
+
+    const response = await axios.get('https://weibo.com/', {
+      headers,
+      validateStatus: () => true,
+      timeout: 30_000,
+      maxRedirects: 10,
+      responseType: 'arraybuffer',
+    });
+
+    console.log(`[open-weibo] got response status: ${response.status}, content-type: ${response.headers['content-type']}`);
     
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Logging in...</title>
-</head>
-<body>
-<script>
-// Redirect to Weibo (browser will make the request with stored cookies)
-window.location.replace('https://weibo.com/');
-</script>
-Loading Weibo...
-</body>
-</html>`;
+    // If we get a login redirect, log it
+    if (response.status === 302 && response.headers['location']?.includes('newlogin')) {
+      console.warn(`[open-weibo] warning: got login redirect despite cookies. Location: ${response.headers['location']}`);
+    }
+
+    // Set content type and send response
+    const contentType = response.headers['content-type'] || 'text/html; charset=utf-8';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.status(response.status);
     
-    return res.send(html);
+    // If we got a redirect to newlogin, try the redirect target
+    if (response.status === 302) {
+      const redirectUrl = response.headers['location'];
+      console.log(`[open-weibo] got 302 redirect to: ${redirectUrl}`);
+      
+      // Try following the redirect manually to get the actual page
+      if (redirectUrl) {
+        try {
+          const redirectResponse = await axios.get(redirectUrl, {
+            headers,
+            validateStatus: () => true,
+            timeout: 30_000,
+            maxRedirects: 5,
+            responseType: 'arraybuffer',
+          });
+          console.log(`[open-weibo] redirect response status: ${redirectResponse.status}`);
+          
+          // Use redirect target response instead
+          const redirectContentType = redirectResponse.headers['content-type'] || 'text/html; charset=utf-8';
+          res.setHeader('Content-Type', redirectContentType);
+          res.status(redirectResponse.status);
+          return res.send(redirectResponse.data);
+        } catch (redirectErr) {
+          console.error('[open-weibo] redirect fetch failed:', redirectErr.message);
+          // Fall through to original response
+        }
+      }
+    }
+    
+    return res.send(response.data);
   } catch (error) {
     console.error('[open-weibo] error:', error.message);
-    return res.status(500).json({ ok: false, error: String(error?.message ?? error) });
+    return res.status(500).send(`<h1>Error</h1><p>${String(error?.message ?? error)}</p>`);
   }
 });
 
