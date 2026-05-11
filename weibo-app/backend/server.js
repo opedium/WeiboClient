@@ -930,27 +930,32 @@ app.get('/api/accounts/:index/open-weibo', async (req, res) => {
       return res.status(400).json({ ok: false, error: '该账户还没有 Cookie' });
     }
 
-    // Parse cookies and set them in response
-    const cookiePairs = cookieStr.split(';').map(c => c.trim()).filter(Boolean);
-    for (const pair of cookiePairs) {
-      const [name, ...valueParts] = pair.split('=');
-      const cookieName = name.trim();
-      const cookieValue = valueParts.join('=').trim();
-      if (cookieName && cookieValue) {
-        res.cookie(cookieName, cookieValue, {
-          domain: '.weibo.com',
-          path: '/',
-          secure: true,
-          sameSite: 'lax',
-          maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        });
-      }
-    }
+    // Proxy to weibo.com with cookies injected
+    const proxyUrl = 'https://weibo.com/';
+    const headers = {
+      'Cookie': cookieStr,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      'Referer': 'https://weibo.com/',
+    };
 
-    // Redirect to weibo
-    return res.redirect('https://weibo.com/');
+    const proxyResp = await axios.get(proxyUrl, {
+      headers,
+      validateStatus: () => true,
+      timeout: 30_000,
+      maxRedirects: 5,
+    });
+
+    // Copy relevant headers from proxy response
+    if (proxyResp.headers['content-type']) {
+      res.setHeader('Content-Type', proxyResp.headers['content-type']);
+    }
+    res.status(proxyResp.status);
+    return res.send(proxyResp.data);
   } catch (error) {
-    return res.status(500).json({ ok: false, error: String(error?.message ?? error) });
+    console.error('[open-weibo] proxy error:', error.message);
+    return res.status(500).send(`<h1>Error loading Weibo</h1><p>${String(error?.message ?? error)}</p>`);
   }
 });
 
