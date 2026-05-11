@@ -79,6 +79,8 @@ app.use(express.json({ limit: JSON_LIMIT }));
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();
   if (PUBLIC_ROUTES.has(req.path)) return next();
+  // Allow open-weibo links to be accessed without auth (so phone links work)
+  if (/^\/api\/accounts\/\d+\/open-weibo$/.test(req.path)) return next();
   if (!AUTH_REQUIRED) return next();
   if (!AUTH_TOKEN) {
     return res.status(500).json({ ok: false, error: 'AUTH_REQUIRED=true but AUTH_TOKEN is empty' });
