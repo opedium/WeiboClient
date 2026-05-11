@@ -930,32 +930,42 @@ app.get('/api/accounts/:index/open-weibo', async (req, res) => {
       return res.status(400).json({ ok: false, error: '该账户还没有 Cookie' });
     }
 
-    // Proxy to weibo.com with cookies injected
-    const proxyUrl = 'https://weibo.com/';
-    const headers = {
-      'Cookie': cookieStr,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-      'Referer': 'https://weibo.com/',
-    };
+    // Parse and set individual cookies, then redirect
+    // Note: This method returns HTML that manually sets cookies and redirects
+    const cookiePairs = cookieStr.split(';').map(c => c.trim()).filter(Boolean);
+    
+    const setCookieHeader = cookiePairs.map(pair => {
+      const [name, ...valueParts] = pair.split('=');
+      const cookieName = name.trim();
+      const cookieValue = valueParts.join('=').trim();
+      if (!cookieName || !cookieValue) return null;
+      // Set for root path, allow cross-site (SameSite=None requires Secure)
+      return `${cookieName}=${cookieValue}; Max-Age=604800; Path=/; SameSite=None; Secure`;
+    }).filter(Boolean);
 
-    const proxyResp = await axios.get(proxyUrl, {
-      headers,
-      validateStatus: () => true,
-      timeout: 30_000,
-      maxRedirects: 5,
-    });
-
-    // Copy relevant headers from proxy response
-    if (proxyResp.headers['content-type']) {
-      res.setHeader('Content-Type', proxyResp.headers['content-type']);
-    }
-    res.status(proxyResp.status);
-    return res.send(proxyResp.data);
+    // Return HTML that redirects with a meta refresh
+    // Cookies won't persist to weibo.com domain due to browser SOP, so we just proxy
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Logging in...</title>
+</head>
+<body>
+<script>
+// Redirect to Weibo (browser will make the request with stored cookies)
+window.location.replace('https://weibo.com/');
+</script>
+Loading Weibo...
+</body>
+</html>`;
+    
+    return res.send(html);
   } catch (error) {
-    console.error('[open-weibo] proxy error:', error.message);
-    return res.status(500).send(`<h1>Error loading Weibo</h1><p>${String(error?.message ?? error)}</p>`);
+    console.error('[open-weibo] error:', error.message);
+    return res.status(500).json({ ok: false, error: String(error?.message ?? error) });
   }
 });
 
