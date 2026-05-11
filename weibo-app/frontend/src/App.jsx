@@ -516,7 +516,9 @@ function AccountsPanel({ onCountChange }) {
 
   useEffect(() => {
     fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+      console.log('[App] Accounts response:', d);
       if (d.ok) {
+        console.log('[App] Setting accounts, count:', (d.accounts ?? []).length);
         setAccounts((d.accounts ?? []).map(a => ({
           name: a.name ?? '',
           cookie: '',
@@ -524,8 +526,12 @@ function AccountsPanel({ onCountChange }) {
           cookieMasked: a.cookieMasked ?? '',
           proxy: a.proxy ?? '',
         })));
+      } else {
+        console.error('[App] Accounts fetch failed:', d.error);
       }
-    }).catch(() => {});
+    }).catch((err) => {
+      console.error('[App] Accounts fetch error:', err);
+    });
     fetch(`${API}/api/keep-alive-log`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       if (d.ok && d.log) setKeepAliveLog(d.log);
     }).catch(() => {});
@@ -1962,13 +1968,13 @@ function OperationForm({ op, account, accountCount, accountNames }) {
           ? { ...values, useRandom: true, randomField: 'content', randomGroup: randomGroup || null }
           : values;
         const data = await callApi(op, body, account);
-        if (data.ok === 1) {
+        if (data.ok) {
           setResult(data.data);
-        } else if (data.data && typeof data.data === 'object' && data.data.ok === 0) {
-          // Error is nested inside data.data (e.g., {ok: true, data: {ok: 0, error_code: 20067, ...}})
+        } else if (data.data && typeof data.data === 'object' && !data.data.ok) {
+          // Error is nested inside data.data (e.g., {ok: false, data: {ok: 0, error_code: 20067, ...}})
           setError(data.data);
         } else {
-          // ok !== 1 means error — store full response so we can check error_code
+          // ok is falsy means error — store full response so we can check error_code
           setError(data);
         }
       }
@@ -2175,6 +2181,9 @@ function OperationForm({ op, account, accountCount, accountNames }) {
       {result !== null && (
         <div className="result success">
           <span className="tag ok">✓ 成功</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+            <span>已返回结果</span>
+          </div>
           <PrettyResponse value={result} opId={op.id} />
         </div>
       )}

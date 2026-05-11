@@ -240,6 +240,7 @@ async function validateCookieLive(cookieStr, proxy = '') {
   let seenLoginError = false;
   let seenDataFetchRestricted = false;
   let lastMessage = '';
+  let seenHttpSuccess = false;
 
   for (const xsrf of [...xsrfCandidates, '']) {
     for (const url of urls) {
@@ -273,6 +274,10 @@ async function validateCookieLive(cookieStr, proxy = '') {
 
       const msg = String(data?.msg ?? data?.message ?? data?.error ?? '').trim();
       if (msg) lastMessage = msg;
+      
+      // Track if we got any HTTP 200 response (not a network error)
+      if (data !== null) seenHttpSuccess = true;
+      
       if (/10017/.test(msg) || /获取数据失败\(10017\)/.test(msg)) {
         seenDataFetchRestricted = true;
       }
@@ -282,7 +287,10 @@ async function validateCookieLive(cookieStr, proxy = '') {
     }
   }
 
-  if (seenDataFetchRestricted && !seenLoginError) {
+  // STRICTER: Only assume valid if we got HTTP success AND 10017 error.
+  // This indicates the account is logged in but the API is rate-limited.
+  // If we got zero user data and login errors, the cookie is invalid.
+  if (seenDataFetchRestricted && !seenLoginError && seenHttpSuccess) {
     return {
       valid: true,
       uid: null,
@@ -716,6 +724,8 @@ app.get('/api/accounts/:index/qr-login/status', async (req, res) => {
       message: 'Cookie 已通过二维码登录刷新并保存',
     });
   } catch (e) {
+    refreshLocks.delete(idx);
+    activeQrSessionByAccount.delete(idx);
     const classified = classifyBackendError(e);
     return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
   }
