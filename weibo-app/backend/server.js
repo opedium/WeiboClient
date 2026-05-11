@@ -1660,8 +1660,8 @@ async function start() {
     console.warn('[cookieRefresh] On Ubuntu, run: npx playwright install ; npx playwright install-deps');
   }
 
-  const server = app.listen(PORT, () => {
-    console.log(`Weibo backend running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Weibo backend running on http://0.0.0.0:${PORT}`);
     startScheduler();
     // Keep-alive disabled — use the 刷新Cookie button manually to avoid proxy traffic.
     // startCookieKeepAlive();
