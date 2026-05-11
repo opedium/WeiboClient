@@ -180,11 +180,13 @@ const batchHandlers = {
   '/api/comment-tweet':      (c, b) => c.commentTweet({ mid: resolveMid(b.mid), content: b.content }),
   '/api/reply-comment':      (c, b) => c.replyComment({ mid: resolveMid(b.mid), cid: b.cid, content: b.content }),
   '/api/delete-comment':     (c, b) => c.deleteComment({ cid: b.cid }),
+  '/api/like-comment':       (c, b) => c.likeComment({ cid: b.cid, rid: b.rid }),
   '/api/follow-user':        (c, b) => c.followUser({ uid: b.uid }),
   '/api/unfollow-user':      (c, b) => c.unfollowUser({ uid: b.uid }),
   '/api/like-tweet':         (c, b) => c.likeTweet({ mid: resolveMid(b.mid) }),
   '/api/unlike-tweet':       (c, b) => c.unlikeTweet({ mid: resolveMid(b.mid) }),
   '/api/follow-super-topic': (c, b) => c.followSuperTopic({ topicId: b.topicId, name: b.name }),
+  '/api/checkin-super-topic':(c, b) => c.checkinSuperTopic({ topicId: b.topicId }),
 };
 
 // ── Main entry point ────────────────────────────────────────────────────────
@@ -324,11 +326,14 @@ export default async ({ req, res, log, error }) => {
       return enrichCommentResult(c, mid, result);
     },
     'POST /api/delete-comment':     (c, b)    => c.deleteComment({ cid: b.cid }),
+    'POST /api/like-comment':       (c, b)    => c.likeComment({ cid: b.cid, rid: b.rid }),
     'POST /api/follow-user':        (c, b)    => c.followUser({ uid: b.uid }),
     'POST /api/unfollow-user':      (c, b)    => c.unfollowUser({ uid: b.uid }),
     'POST /api/like-tweet':         (c, b)    => c.likeTweet({ mid: resolveMid(b.mid) }),
     'POST /api/unlike-tweet':       (c, b)    => c.unlikeTweet({ mid: resolveMid(b.mid) }),
     'POST /api/follow-super-topic': (c, b)    => c.followSuperTopic({ topicId: b.topicId, name: b.name }),
+    'POST /api/checkin-super-topic':(c, b)    => c.checkinSuperTopic({ topicId: b.topicId }),
+    'GET /api/search-super-topics': (c, b, q) => c.searchSuperTopics({ keyword: q.keyword, page: q.page }),
     'GET /api/friends-tweets':      (c, b, q) => c.fetchFriendsTweets({ sinceId: q.sinceId }),
     'GET /api/my-comments':         (c, b, q) => c.fetchMyComments({ cursor: q.cursor }),
     'GET /api/collections':         (c)       => c.fetchCollections(),

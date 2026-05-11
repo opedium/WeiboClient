@@ -22,6 +22,7 @@ import {
   startCaptchaVerification,
   getCaptchaStatus,
   cancelCaptchaSession,
+  openAccountInBrowser,
 } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
@@ -879,6 +880,76 @@ app.post('/api/accounts/:index/captcha/cancel', async (req, res) => {
 
   const result = await cancelCaptchaSession(sessionId);
   return res.json({ ok: true, ...result });
+});
+
+// ── open account in browser ────────────────────────────────
+app.post('/api/accounts/:index/open-in-browser', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: '账户不存在' });
+    }
+
+    const account = accounts[idx];
+    const result = await openAccountInBrowser({
+      accountIndex: idx,
+      accountName: account.name,
+      cookieString: account.cookie,
+      proxy: String(req.body?.proxy ?? process.env.HTTPS_PROXY ?? '').trim(),
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: String(error?.message ?? error) });
+  }
+});
+
+// ── authenticated weibo redirect (for remote servers + mobile) ─────────────
+app.get('/api/accounts/:index/open-weibo', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: '账户不存在' });
+    }
+
+    const account = accounts[idx];
+    const cookieStr = String(account.cookie ?? '').trim();
+    if (!cookieStr) {
+      return res.status(400).json({ ok: false, error: '该账户还没有 Cookie' });
+    }
+
+    // Parse cookies and set them in response
+    const cookiePairs = cookieStr.split(';').map(c => c.trim()).filter(Boolean);
+    for (const pair of cookiePairs) {
+      const [name, ...valueParts] = pair.split('=');
+      const cookieName = name.trim();
+      const cookieValue = valueParts.join('=').trim();
+      if (cookieName && cookieValue) {
+        res.cookie(cookieName, cookieValue, {
+          domain: '.weibo.com',
+          path: '/',
+          secure: true,
+          sameSite: 'lax',
+          maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        });
+      }
+    }
+
+    // Redirect to weibo
+    return res.redirect('https://weibo.com/');
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: String(error?.message ?? error) });
+  }
 });
 
 // ── tweet ─────────────────────────────────────────────────

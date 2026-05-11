@@ -511,6 +511,7 @@ function AccountsPanel({ onCountChange }) {
   const [validResults, setValidResults] = useState({}); // {index: {valid, name, uid, avatar, error, missingRec}}
   const [keepAliveLog, setKeepAliveLog] = useState(null);
   const [resetting, setResetting] = useState({}); // {index: true/false}
+  const [openingBrowser, setOpeningBrowser] = useState({}); // {index: true/false}
   const [qrLogin, setQrLogin] = useState(null); // { index, sessionId, qrDataUrl, status, error, expiresAt }
   const qrPollRef = useRef(null);
 
@@ -642,6 +643,42 @@ function AccountsPanel({ onCountChange }) {
       setSaveError(`账号 ${i + 1} 重置失败: ${err.message}`);
     } finally {
       setResetting(v => ({ ...v, [i]: false }));
+    }
+  };
+
+  const openInBrowser = async (i) => {
+    const acc = accounts[i];
+    if (!acc?.hasCookie && !acc?.cookie?.trim()) {
+      setSaveError(`账号 ${i + 1} 还没有 Cookie，请先添加或验证`);
+      return;
+    }
+    setOpeningBrowser(v => ({ ...v, [i]: true }));
+    setSaveError(null);
+    try {
+      const res = await fetch(`${API}/api/accounts/${i}/open-in-browser`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error ?? '打开失败');
+      
+      // Handle two modes: 'edge' (local browser) or 'link' (remote server)
+      if (data.mode === 'link') {
+        // Show clickable link for remote/mobile
+        const fullLink = data.link.startsWith('http') ? data.link : `${API}${data.link}`;
+        setSaveError(`${data.message}:\n${fullLink}`);
+        // Also try to open it
+        window.open(fullLink, '_blank');
+      } else {
+        // Local Edge browser opened
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      }
+    } catch (err) {
+      setSaveError(`账号 ${i + 1} 打开失败: ${err.message}`);
+    } finally {
+      setOpeningBrowser(v => ({ ...v, [i]: false }));
     }
   };
 
@@ -855,6 +892,14 @@ function AccountsPanel({ onCountChange }) {
                 title="清除该账号的浏览器缓存和 session，下次刷新 Cookie 时重新登录"
               >
                 {resetting[i] ? '重置中…' : '重置浏览器'}
+              </button>
+              <button
+                className="btn-validate"
+                onClick={() => openInBrowser(i)}
+                disabled={!!openingBrowser[i] || (!acc.hasCookie && !acc.cookie.trim())}
+                title="在浏览器中打开已登录的账户"
+              >
+                {openingBrowser[i] ? '打开中…' : '打开账户'}
               </button>
               <button className="copy-del" onClick={() => removeAccount(i)}>删除</button>
             </div>

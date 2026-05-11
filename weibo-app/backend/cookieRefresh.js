@@ -13,6 +13,19 @@ const CAPTCHA_TTL_MS = Math.max(60_000, Number.parseInt(process.env.CAPTCHA_TTL_
 const qrSessions = new Map();
 const captchaSessions = new Map();
 
+// Edge browser detection
+function getEdgeExecutablePath() {
+  const possiblePaths = [
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\MicrosoftEdge.exe',
+  ];
+  for (const edgePath of possiblePaths) {
+    if (fs.existsSync(edgePath)) return edgePath;
+  }
+  return null; // Fall back to system default
+}
+
 function canOpenVisibleBrowser() {
   if (COOKIE_REFRESH_MODE === 'headless') return false;
   if (COOKIE_REFRESH_MODE === 'manual') return true;
@@ -147,8 +160,10 @@ export async function startQrLoginSession({ accountIndex, accountName = '', prox
 
   const proxyConfig = parsePlaywrightProxy(proxy);
   const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+  const edgePath = getEdgeExecutablePath();
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: true,
+    executablePath: edgePath || undefined,
     proxy: proxyConfig || undefined,
   });
 
@@ -232,7 +247,8 @@ export async function cancelQrLoginSession(sessionId) {
 export async function checkPlaywrightRuntime() {
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    const edgePath = getEdgeExecutablePath();
+    browser = await chromium.launch({ headless: true, executablePath: edgePath || undefined });
     await browser.close();
     return { ok: true };
   } catch (error) {
@@ -401,8 +417,10 @@ async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
   let context;
   try {
     clearChromiumLocks(userDataDir);
+    const edgePath = getEdgeExecutablePath();
     context = await chromium.launchPersistentContext(userDataDir, {
       headless: true,
+      executablePath: edgePath || undefined,
       proxy: proxyConfig || undefined,
     });
 
@@ -441,8 +459,10 @@ async function refreshCookieWithVisibleBrowser({ userDataDir, proxy = '', maxWai
   let context;
   try {
     clearChromiumLocks(userDataDir);
+    const edgePath = getEdgeExecutablePath();
     context = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
+      executablePath: edgePath || undefined,
       viewport: { width: 1280, height: 900 },
       proxy: proxyConfig || undefined,
     });
@@ -770,4 +790,98 @@ export async function refreshCookieViaManualLogin({ accountIndex, accountName = 
 
     throw new Error(explainHeadfulNotAvailable('未找到该账号会话，请改用页面二维码登录'));
   });
+}
+
+/**
+ * Opens a visible browser window with pre-stored cookies (no login needed).
+ * - Local desktop: Launches Edge browser with cookies injected
+ * - Remote server: Returns authenticated redirect link for client's browser
+ */
+export async function openAccountInBrowser({ accountIndex, accountName = '', cookieString = '', proxy = '' }) {
+  if (!cookieString || !cookieString.trim()) {
+    return { ok: false, error: '账户没有保存 Cookie，请先添加账户' };
+  }
+
+  if (!hasRequiredSessionCookies(cookieString)) {
+    return { ok: false, error: 'Cookie 无效（缺少 SUB 或 XSRF-TOKEN）' };
+  }
+
+  // Detect if we're on a server without GUI (headless)
+  const isHeadless = !canOpenVisibleBrowser();
+  
+  if (isHeadless) {
+    // Return authenticated redirect link for mobile/remote browsers
+    console.log(`[openAccountInBrowser] headless mode detected, returning auth link for account-${accountIndex + 1}`);
+    return {
+      ok: true,
+      mode: 'link',
+      link: `/api/accounts/${accountIndex}/open-weibo`,
+      message: `点击下方链接在浏览器中打开已登录的账户`,
+      accountIndex,
+      accountName,
+    };
+  }
+
+  // Local desktop: Launch visible Edge browser
+  console.log(`[openAccountInBrowser] desktop mode, launching Edge for account-${accountIndex + 1}...`);
+  
+  const proxyConfig = parsePlaywrightProxy(proxy);
+  let browser;
+  let context;
+
+  try {
+    // Launch browser with Edge
+    const edgePath = getEdgeExecutablePath();
+    browser = await chromium.launch({
+      headless: false,
+      executablePath: edgePath || undefined,
+      proxy: proxyConfig || undefined,
+    });
+
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 900 },
+    });
+
+    // Parse and inject cookies
+    const cookiePairs = cookieString.split(';').map(c => c.trim()).filter(Boolean);
+    const cookies = cookiePairs.map(pair => {
+      const [name, ...valueParts] = pair.split('=');
+      return {
+        name: name.trim(),
+        value: valueParts.join('=').trim(),
+        domain: '.weibo.com',
+        path: '/',
+      };
+    });
+
+    await context.addCookies(cookies);
+
+    // Open weibo.com with cookies already set
+    const page = await context.newPage();
+    try {
+      await page.goto('https://weibo.com/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (navError) {
+      // Navigation error is OK - browser is still open, user can navigate manually
+      console.log(`[openAccountInBrowser] navigation had issue: ${navError.message}`);
+    }
+
+    // Browser stays open; don't close it
+    console.log(`[openAccountInBrowser] Edge browser opened successfully for account-${accountIndex + 1}`);
+    return {
+      ok: true,
+      mode: 'edge',
+      message: `已在 Edge 浏览器中打开账户"${accountName || `account-${accountIndex + 1}`}"`,
+      accountIndex,
+      accountName,
+    };
+  } catch (error) {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
+    console.error(`[openAccountInBrowser] failed for account-${accountIndex + 1}:`, error.message);
+    return {
+      ok: false,
+      error: `打开浏览器失败: ${String(error?.message ?? error)}`,
+    };
+  }
 }
