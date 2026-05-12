@@ -25,7 +25,8 @@ import {
   openAccountInBrowser,
 } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
-         getSchedules, addSchedule, updateSchedule, deleteSchedule } from './db.js';
+         getSchedules, addSchedule, updateSchedule, deleteSchedule, saveKeepAliveLog, getKeepAliveLogs, getLatestKeepAliveLog,
+         saveKeepAliveConfig, getKeepAliveConfig } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3001);
@@ -63,6 +64,17 @@ const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: UPLOAD_MAX_BYTES },
+});
+
+// Disable caching for API responses (prevent 304 Not Modified)
+app.disable('etag');
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+  }
+  next();
 });
 
 app.use(cors({
@@ -1654,16 +1666,143 @@ function startScheduler() {
 }
 
 // ── cookie keep-alive ────────────────────────────────────
-const KEEP_ALIVE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 24 * 60 * 60 * 1000; // default: every 24 hours
-const KEEP_ALIVE_FIRST_DELAY_MS = Number(process.env.KEEP_ALIVE_FIRST_DELAY_MS) || 6 * 60 * 60 * 1000; // default: 6h after startup
+let KEEP_ALIVE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 24 * 60 * 60 * 1000; // default: every 24 hours
+let KEEP_ALIVE_FIRST_DELAY_MS = Number(process.env.KEEP_ALIVE_FIRST_DELAY_MS) || 6 * 60 * 60 * 1000; // default: 6h after startup
 
 let keepAliveLog = null; // { ranAt, results: [{accountIndex, accountName, ok, error?}] }
+let keepAliveTimeoutId = null;
+let keepAliveIntervalId = null;
 
 app.get('/api/keep-alive-log', (_req, res) => {
   res.json({ ok: true, log: keepAliveLog });
 });
 
-function startCookieKeepAlive() {
+app.get('/api/keep-alive-logs', async (_req, res) => {
+  try {
+    const logs = await getKeepAliveLogs(100);
+    res.json({ ok: true, logs: logs.map(log => ({
+      _id: log._id,
+      ranAt: log.ranAt,
+      results: log.results,
+      createdAt: log.createdAt,
+    })) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/keep-alive-config', (req, res) => {
+  if (AUTH_REQUIRED) {
+    const token = req.headers['x-auth-token'];
+    if (!safeTokenEqual(token, AUTH_TOKEN)) {
+      return res.status(401).json({ ok: false, error: '未授权' });
+    }
+  }
+  res.json({
+    ok: true,
+    intervalMs: KEEP_ALIVE_INTERVAL_MS,
+    firstDelayMs: KEEP_ALIVE_FIRST_DELAY_MS,
+  });
+});
+
+app.post('/api/keep-alive-config', async (req, res) => {
+  if (AUTH_REQUIRED) {
+    const token = req.headers['x-auth-token'];
+    if (!safeTokenEqual(token, AUTH_TOKEN)) {
+      return res.status(401).json({ ok: false, error: '未授权' });
+    }
+  }
+  const { intervalMs, firstDelayMs } = req.body ?? {};
+  const interval = Number(intervalMs);
+  const firstDelay = Number(firstDelayMs);
+
+  // Validate inputs
+  if (isNaN(interval) || interval < 60000) {
+    return res.status(400).json({ ok: false, error: 'intervalMs must be >= 60000 (1 minute)' });
+  }
+  if (isNaN(firstDelay) || firstDelay < 0) {
+    return res.status(400).json({ ok: false, error: 'firstDelayMs must be >= 0' });
+  }
+
+  KEEP_ALIVE_INTERVAL_MS = interval;
+  KEEP_ALIVE_FIRST_DELAY_MS = firstDelay;
+
+  // Save config to MongoDB
+  try {
+    await saveKeepAliveConfig(interval, firstDelay);
+  } catch (err) {
+    console.warn(`Failed to save keep-alive config: ${err.message}`);
+  }
+
+  // Restart keep-alive with new schedule
+  if (keepAliveTimeoutId !== null) clearTimeout(keepAliveTimeoutId);
+  if (keepAliveIntervalId !== null) clearInterval(keepAliveIntervalId);
+  await startCookieKeepAlive();
+
+  res.json({
+    ok: true,
+    intervalMs: KEEP_ALIVE_INTERVAL_MS,
+    firstDelayMs: KEEP_ALIVE_FIRST_DELAY_MS,
+    message: 'Keep-alive schedule updated and restarted',
+  });
+});
+
+app.post('/api/keep-alive/run', async (req, res) => {
+  if (AUTH_REQUIRED) {
+    const token = req.headers['x-auth-token'];
+    if (!safeTokenEqual(token, AUTH_TOKEN)) {
+      return res.status(401).json({ ok: false, error: '未授权' });
+    }
+  }
+  
+  try {
+    const accounts = await getAccounts();
+    if (!accounts.length) {
+      return res.json({ ok: true, message: 'No accounts to refresh', results: [] });
+    }
+    
+    const results = await keepAliveAllAccounts(accounts);
+    const updated = accounts.map((a, i) => {
+      const r = results.find(x => x.accountIndex === i);
+      return r?.ok && r.cookie ? { ...a, cookie: r.cookie } : a;
+    });
+    await setAccounts(updated);
+    
+    keepAliveLog = {
+      ranAt: new Date().toISOString(),
+      results: results.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
+    };
+    // Save to MongoDB if configured
+    await saveKeepAliveLog(keepAliveLog).catch(err => console.error('Failed to save keep-alive log:', err.message));
+    
+    const ok = results.filter(r => r.ok).length;
+    const fail = results.filter(r => !r.ok && r.error !== 'no_profile').length;
+    console.log(`Keep-alive manual run: ${ok} refreshed, ${fail} failed`);
+    
+    res.json({
+      ok: true,
+      message: `Keep-alive completed: ${ok} refreshed, ${fail} failed`,
+      log: keepAliveLog,
+    });
+  } catch (err) {
+    console.error('Manual keep-alive run failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+async function startCookieKeepAlive() {
+  // Load config from MongoDB if it exists
+  try {
+    const savedConfig = await getKeepAliveConfig();
+    if (savedConfig) {
+      KEEP_ALIVE_INTERVAL_MS = savedConfig.intervalMs;
+      KEEP_ALIVE_FIRST_DELAY_MS = savedConfig.firstDelayMs;
+      console.log(`Keep-alive config loaded from MongoDB: interval=${Math.round(savedConfig.intervalMs / 3_600_000 * 10) / 10}h, firstDelay=${Math.round(savedConfig.firstDelayMs / 3_600_000 * 10) / 10}h`);
+    }
+  } catch (err) {
+    console.warn(`Failed to load keep-alive config from MongoDB: ${err.message}`);
+  }
+
   const run = async () => {
     try {
       const accounts = await getAccounts();
@@ -1678,6 +1817,8 @@ function startCookieKeepAlive() {
         ranAt: new Date().toISOString(),
         results: results.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
       };
+      // Save to MongoDB if configured
+      await saveKeepAliveLog(keepAliveLog).catch(err => console.error('Failed to save keep-alive log:', err.message));
       const ok = results.filter(r => r.ok).length;
       const fail = results.filter(r => !r.ok && r.error !== 'no_profile').length;
       if (ok || fail) console.log(`Cookie keep-alive: ${ok} refreshed, ${fail} failed`);
@@ -1688,8 +1829,8 @@ function startCookieKeepAlive() {
 
   // Run first time after KEEP_ALIVE_FIRST_DELAY_MS (default 6h), then every KEEP_ALIVE_INTERVAL_MS (default 24h).
   console.log(`Cookie keep-alive: first run in ${Math.round(KEEP_ALIVE_FIRST_DELAY_MS / 3_600_000 * 10) / 10}h, then every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 3_600_000 * 10) / 10}h`);
-  setTimeout(() => { void run(); }, KEEP_ALIVE_FIRST_DELAY_MS);
-  setInterval(() => { void run(); }, KEEP_ALIVE_INTERVAL_MS);
+  keepAliveTimeoutId = setTimeout(() => { void run(); }, KEEP_ALIVE_FIRST_DELAY_MS);
+  keepAliveIntervalId = setInterval(() => { void run(); }, KEEP_ALIVE_INTERVAL_MS);
 }
 
 // ── start ─────────────────────────────────────────────────
@@ -1713,11 +1854,10 @@ async function start() {
     console.warn('[cookieRefresh] On Ubuntu, run: npx playwright install ; npx playwright install-deps');
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Weibo backend running on http://0.0.0.0:${PORT}`);
     startScheduler();
-    // Keep-alive disabled — use the 刷新Cookie button manually to avoid proxy traffic.
-    // startCookieKeepAlive();
+    await startCookieKeepAlive();
   });
 
   server.on('error', (err) => {

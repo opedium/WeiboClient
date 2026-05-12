@@ -23,6 +23,7 @@ const DB_NAME        = process.env.MONGODB_DB                   ?? 'weibo_app';
 const COPY_COL       = process.env.MONGODB_COLLECTION           ?? 'copywriting';
 const ACCOUNTS_COL   = process.env.MONGODB_ACCOUNTS_COLLECTION  ?? 'accounts';
 const SCHEDULES_COL  = process.env.MONGODB_SCHEDULES_COLLECTION ?? 'schedules';
+const KEEPALIVE_LOGS_COL = process.env.MONGODB_KEEPALIVE_LOGS_COLLECTION ?? 'keepalive_logs';
 
 let client;
 let db;
@@ -259,4 +260,59 @@ export async function deleteSchedule(id) {
       await c.deleteOne({ _id: new ObjectId(id) });
     } catch { /* not a valid ObjectId, ignore */ }
   }
+}
+
+// ── keep-alive logs ───────────────────────────────────────────────────────
+
+/** Save a keep-alive log entry */
+export async function saveKeepAliveLog(log) {
+  if (!isDBConfigured()) return; // Keep in-memory only if no DB configured
+  const c = await col(KEEPALIVE_LOGS_COL);
+  await c.insertOne({
+    ranAt: new Date(log.ranAt),
+    results: log.results,
+    createdAt: new Date(),
+  });
+}
+
+/** Get keep-alive log history (latest first) */
+export async function getKeepAliveLogs(limit = 20) {
+  if (!isDBConfigured()) return [];
+  const c = await col(KEEPALIVE_LOGS_COL);
+  return c
+    .find({}, { projection: { _id: 1, ranAt: 1, results: 1, createdAt: 1 } })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .toArray();
+}
+
+/** Get latest keep-alive log */
+export async function getLatestKeepAliveLog() {
+  if (!isDBConfigured()) return null;
+  const c = await col(KEEPALIVE_LOGS_COL);
+  return c.findOne({}, { sort: { createdAt: -1 } });
+}
+
+/** Save keep-alive configuration to MongoDB */
+export async function saveKeepAliveConfig(intervalMs, firstDelayMs) {
+  if (!isDBConfigured()) return null;
+  const c = await col(KEEPALIVE_LOGS_COL);
+  return c.updateOne(
+    { _id: 'keep-alive-config' },
+    {
+      $set: {
+        intervalMs,
+        firstDelayMs,
+        updatedAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
+/** Load keep-alive configuration from MongoDB */
+export async function getKeepAliveConfig() {
+  if (!isDBConfigured()) return null;
+  const c = await col(KEEPALIVE_LOGS_COL);
+  return c.findOne({ _id: 'keep-alive-config' });
 }

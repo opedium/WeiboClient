@@ -2274,16 +2274,369 @@ function OperationForm({ op, account, accountCount, accountNames }) {
   );
 }
 
+// ── KeepAliveLogsPanel ────────────────────────────────────────
+function KeepAliveLogsPanel() {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [latestLog, setLatestLog] = useState(null);
+  
+  // Config state
+  const [config, setConfig] = useState(null);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configError, setConfigError] = useState('');
+  const [editConfig, setEditConfig] = useState(false);
+  const [formInterval, setFormInterval] = useState('');
+  const [formFirstDelay, setFormFirstDelay] = useState('');
+  const [configSubmitting, setConfigSubmitting] = useState(false);
+
+  const [isTriggering, setIsTriggering] = useState(false);
+
+  const triggerRun = useCallback(async () => {
+    setIsTriggering(true);
+    setError('');
+    try {
+      const res = await fetch(`${API}/api/keep-alive/run`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'x-auth-token': getToken() },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error ?? '执行失败');
+      console.log('Keep-alive run triggered:', d.message);
+      // After trigger, wait a moment then load fresh data
+      setTimeout(() => load(), 500);
+    } catch (err) {
+      const msg = err?.message || '触发失败';
+      console.error('KeepAliveLogsPanel triggerRun error:', msg, err);
+      setError(msg);
+      setIsTriggering(false);
+    }
+  }, []);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError('');
+    
+    // Fetch both latest and history
+    Promise.all([
+      fetch(`${API}/api/keep-alive-log`, { 
+        credentials: 'include',
+        headers: { 'x-auth-token': getToken() } 
+      })
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        }),
+      fetch(`${API}/api/keep-alive-logs`, { 
+        credentials: 'include',
+        headers: { 'x-auth-token': getToken() } 
+      })
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        }),
+    ])
+      .then(([latest, history]) => {
+        if (latest?.ok) setLatestLog(latest.log);
+        else if (latest?.error) throw new Error(latest.error);
+        
+        if (history?.ok) setLogs(history.logs ?? []);
+        else if (history?.error) throw new Error(history.error);
+      })
+      .catch(err => {
+        const msg = err?.message || '加载失败';
+        console.error('KeepAliveLogsPanel load error:', msg, err);
+        setError(msg);
+      })
+      .finally(() => {
+        setLoading(false);
+        setIsTriggering(false);
+      });
+  }, []);
+
+  const loadConfig = useCallback(() => {
+    setConfigLoading(true);
+    setConfigError('');
+    fetch(`${API}/api/keep-alive-config`, { 
+      credentials: 'include',
+      headers: { 'x-auth-token': getToken() } 
+    })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(d => {
+        if (d.ok) {
+          setConfig(d);
+          setFormInterval(String(d.intervalMs));
+          setFormFirstDelay(String(d.firstDelayMs));
+        } else {
+          throw new Error(d.error ?? '加载配置失败');
+        }
+      })
+      .catch(err => {
+        const msg = err?.message || '加载配置失败';
+        console.error('KeepAliveLogsPanel loadConfig error:', msg, err);
+        setConfigError(msg);
+      })
+      .finally(() => setConfigLoading(false));
+  }, []);
+
+  useEffect(() => { 
+    load();
+    loadConfig();
+  }, [load, loadConfig]);
+
+  const saveConfig = async () => {
+    setConfigSubmitting(true);
+    setConfigError('');
+    try {
+      const res = await fetch(`${API}/api/keep-alive-config`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-auth-token': getToken(),
+        },
+        body: JSON.stringify({
+          intervalMs: Number(formInterval),
+          firstDelayMs: Number(formFirstDelay),
+        }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error ?? '保存失败');
+      setConfig(d);
+      setEditConfig(false);
+    } catch (err) {
+      setConfigError(err.message ?? '保存失败');
+    } finally {
+      setConfigSubmitting(false);
+    }
+  };
+
+  // Compute which accounts need manual login
+  const accountsNeedingLogin = new Set();
+  if (latestLog?.results) {
+    latestLog.results.forEach(r => {
+      if (!r.ok && r.error !== 'no_profile') {
+        accountsNeedingLogin.add(r.accountIndex);
+      }
+    });
+  }
+
+  const formatTime = (dateStr) => {
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleString('zh-CN', { 
+        year: 'numeric', 
+        month: '2-digit', 
+        day: '2-digit', 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit' 
+      });
+    } catch {
+      return dateStr;
+    }
+  };
+
+  const formatDuration = (ms) => {
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.floor((ms % 3_600_000) / 60_000);
+    if (h > 0) return `${h}h${m}m`;
+    return `${m}m`;
+  };
+
+  if (loading && !config) {
+    return (
+      <div className="panel-wrapper">
+        <h2>Cookie 保活日志</h2>
+        <div className="result info">
+          <span className="tag">⏳</span>
+          加载中…
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="panel-wrapper" style={{ padding: '12px 16px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <h2 style={{ margin: 0 }}>Cookie 保活日志</h2>
+        <button 
+          className="btn-secondary" 
+          onClick={triggerRun} 
+          disabled={isTriggering || loading}
+          style={{ fontSize: 12, padding: '4px 8px' }}
+        >
+          🔄 {isTriggering ? '执行中...' : '刷新'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="result error" style={{ marginBottom: 16 }}>
+          <span className="tag err">✗</span>
+          {error}
+        </div>
+      )}
+
+      {/* Configuration Section */}
+      {config && (
+        <div className="op-card" style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: '#999', fontWeight: 'bold' }}>⚙️ 保活计划</div>
+            <button
+              className="btn-secondary"
+              onClick={() => setEditConfig(!editConfig)}
+              style={{ fontSize: 11, padding: '2px 6px' }}
+            >
+              {editConfig ? '取消' : '编辑'}
+            </button>
+          </div>
+
+          {!editConfig ? (
+            <div style={{ display: 'grid', gap: 8, fontSize: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#999' }}>首次延迟</span>
+                <span>{formatDuration(config.firstDelayMs)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#999' }}>执行间隔</span>
+                <span>{formatDuration(config.intervalMs)}</span>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 10 }}>
+              <label style={{ fontSize: 11 }}>
+                <div style={{ marginBottom: 4, color: '#999' }}>首次延迟 (毫秒, 最少 0)</div>
+                <input
+                  type="number"
+                  value={formFirstDelay}
+                  onChange={e => setFormFirstDelay(e.target.value)}
+                  min={0}
+                  step={60000}
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                />
+              </label>
+              <label style={{ fontSize: 11 }}>
+                <div style={{ marginBottom: 4, color: '#999' }}>执行间隔 (毫秒, 最少 60000)</div>
+                <input
+                  type="number"
+                  value={formInterval}
+                  onChange={e => setFormInterval(e.target.value)}
+                  min={60000}
+                  step={60000}
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                />
+              </label>
+              <button
+                className="btn-submit"
+                onClick={saveConfig}
+                disabled={configSubmitting}
+                style={{ fontSize: 12, padding: '6px 12px' }}
+              >
+                {configSubmitting ? '保存中...' : '保存配置'}
+              </button>
+              {configError && (
+                <div style={{ fontSize: 11, color: '#ff6464' }}>✗ {configError}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Need Manual Login Warning */}
+      {accountsNeedingLogin.size > 0 && (
+        <div className="result error" style={{ marginBottom: 16 }}>
+          <span className="tag err">⚠️ 需要手动登录</span>
+          <div style={{ marginTop: 8, fontSize: 12 }}>
+            {Array.from(accountsNeedingLogin).map((idx, i) => (
+              <div key={i}>账号 {idx + 1}: Cookie 已过期或无效，请点击"账号管理"手动刷新</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Latest log */}
+      {latestLog && (
+        <div className="op-card" style={{ marginBottom: 16 }}>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>最新执行</div>
+            <div style={{ fontSize: 14, fontWeight: 'bold' }}>{formatTime(latestLog.ranAt)}</div>
+          </div>
+          <div style={{ display: 'grid', gap: 8 }}>
+            {latestLog.results?.map((r, i) => (
+              <div key={i} style={{ 
+                padding: 8, 
+                borderRadius: 4, 
+                backgroundColor: r.ok ? 'rgba(10, 170, 50, 0.1)' : 'rgba(255, 100, 100, 0.1)',
+                borderLeft: `3px solid ${r.ok ? '#0aa832' : '#ff6464'}`
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <span style={{ fontWeight: 'bold' }}>账号 {r.accountIndex + 1}</span>
+                    {r.accountName && <span style={{ color: '#999', marginLeft: 8 }}>({r.accountName})</span>}
+                  </div>
+                  <span style={{ fontSize: 12, color: r.ok ? '#0aa832' : '#ff6464' }}>
+                    {r.ok ? '✓ 成功' : '✗ ' + (r.error || '失败')}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* History logs */}
+      {logs.length > 0 ? (
+        <div>
+          <div style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>历史记录</div>
+          <div style={{ display: 'grid', gap: 8 }}>
+            {logs.map((log, logIdx) => (
+              <div key={logIdx} className="op-card" style={{ padding: 12 }}>
+                <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+                  {formatTime(log.ranAt || log.createdAt)}
+                </div>
+                <div style={{ display: 'grid', gap: 6 }}>
+                  {log.results?.map((r, i) => (
+                    <div key={i} style={{ fontSize: 12, display: 'flex', justifyContent: 'space-between' }}>
+                      <span>账号 {r.accountIndex + 1}</span>
+                      <span style={{ color: r.ok ? '#0aa832' : '#ff6464' }}>
+                        {r.ok ? '✓' : '✗ ' + (r.error?.substring(0, 20) || '失败')}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        !loading && (
+          <div className="result info">
+            <span className="tag">ℹ️</span>
+            暂无日志记录
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
 function AppShell() {
   const [selected, setSelected] = useState(OPERATIONS[0]);
   const [showCopywriting, setShowCopywriting] = useState(false);
   const [showAccounts, setShowAccounts] = useState(false);
   const [showSchedules, setShowSchedules] = useState(false);
   const [showInbox, setShowInbox] = useState(false);
+  const [showKeepAliveLogs, setShowKeepAliveLogs] = useState(false);
   const [account, setAccount] = useState(0);
   const [accountCount, setAccountCount] = useState(1);
   const [accountNames, setAccountNames] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [accountsNeedingLogin, setAccountsNeedingLogin] = useState(new Set());
 
   const refreshAccounts = useCallback(() => {
     fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
@@ -2294,9 +2647,41 @@ function AppShell() {
     }).catch(() => {});
   }, []);
 
-  useEffect(() => { refreshAccounts(); }, [refreshAccounts]);
+  // Fetch keep-alive log to check which accounts need manual login
+  const checkAccountStatus = useCallback(() => {
+    fetch(`${API}/api/keep-alive-log`, { 
+      credentials: 'include',
+      headers: { 'x-auth-token': getToken() } 
+    })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(d => {
+        if (d.ok && d.log?.results) {
+          const needingLogin = new Set();
+          d.log.results.forEach(r => {
+            if (!r.ok && r.error !== 'no_profile') {
+              needingLogin.add(r.accountIndex);
+            }
+          });
+          setAccountsNeedingLogin(needingLogin);
+        }
+      })
+      .catch(err => {
+        console.debug('checkAccountStatus error:', err.message);
+      });
+  }, []);
 
-  const selectOp = (op) => { setSelected(op); setShowCopywriting(false); setShowAccounts(false); setShowSchedules(false); setShowInbox(false); setSidebarOpen(false); };
+  useEffect(() => { 
+    refreshAccounts();
+    checkAccountStatus();
+    // Refresh status every 30 seconds
+    const interval = setInterval(checkAccountStatus, 30000);
+    return () => clearInterval(interval);
+  }, [refreshAccounts, checkAccountStatus]);
+
+  const selectOp = (op) => { setSelected(op); setShowCopywriting(false); setShowAccounts(false); setShowSchedules(false); setShowInbox(false); setShowKeepAliveLogs(false); setSidebarOpen(false); };
 
   return (
     <div className="layout">
@@ -2309,10 +2694,34 @@ function AppShell() {
             <div className="account-select">
               <label>账号</label>
               <select value={account} onChange={e => setAccount(Number(e.target.value))}>
-                {Array.from({ length: accountCount }, (_, i) => (
-                  <option key={i} value={i}>{accountNames[i] ?? `账号 ${i + 1}`}</option>
-                ))}
+                {Array.from({ length: accountCount }, (_, i) => {
+                  const needsLogin = accountsNeedingLogin.has(i);
+                  const prefix = needsLogin ? '⚠️ ' : '';
+                  return (
+                    <option key={i} value={i}>
+                      {prefix}{accountNames[i] ?? `账号 ${i + 1}`}
+                    </option>
+                  );
+                })}
               </select>
+            </div>
+          )}
+          {accountsNeedingLogin.size > 0 && (
+            <div style={{ 
+              padding: '8px 10px', 
+              marginTop: 8, 
+              backgroundColor: 'rgba(255, 100, 100, 0.1)', 
+              borderLeft: '3px solid #ff6464',
+              borderRadius: 3,
+              fontSize: 11,
+              color: '#ff6464'
+            }}>
+              <div style={{ fontWeight: 'bold', marginBottom: 4 }}>⚠️ Cookie 已过期</div>
+              <div style={{ fontSize: 10, opacity: 0.8 }}>
+                {Array.from(accountsNeedingLogin).map((idx, i) => (
+                  <div key={i}>账号 {idx + 1} 需要手动登录</div>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -2353,9 +2762,15 @@ function AppShell() {
             </button>
             <button
               className={`nav-item${showInbox ? ' active' : ''}`}
-              onClick={() => { setShowInbox(true); setShowAccounts(false); setShowCopywriting(false); setShowSchedules(false); setSidebarOpen(false); }}
+              onClick={() => { setShowInbox(true); setShowAccounts(false); setShowCopywriting(false); setShowSchedules(false); setShowKeepAliveLogs(false); setSidebarOpen(false); }}
             >
               📬 收件箱
+            </button>
+            <button
+              className={`nav-item${showKeepAliveLogs ? ' active' : ''}`}
+              onClick={() => { setShowKeepAliveLogs(true); setShowInbox(false); setShowAccounts(false); setShowCopywriting(false); setShowSchedules(false); setSidebarOpen(false); }}
+            >
+              🔄 保活日志
             </button>
           </div>
         </nav>
@@ -2369,6 +2784,8 @@ function AppShell() {
           ? <SchedulesPanel accountNames={accountNames} />
           : showInbox
           ? <InboxPanel account={account} />
+          : showKeepAliveLogs
+          ? <KeepAliveLogsPanel />
           : <OperationForm key={selected.id} op={selected} account={account} accountCount={accountCount} accountNames={accountNames} />
         }
       </main>
