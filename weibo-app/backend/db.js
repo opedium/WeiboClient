@@ -316,3 +316,15 @@ export async function getKeepAliveConfig() {
   const c = await col(KEEPALIVE_LOGS_COL);
   return c.findOne({ _id: 'keep-alive-config' });
 }
+
+/** Delete keep-alive logs older than 24 hours */
+export async function deleteOldKeepAliveLogs() {
+  if (!isDBConfigured()) return { deletedCount: 0 };
+  const c = await col(KEEPALIVE_LOGS_COL);
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const result = await c.deleteMany({
+    createdAt: { $lt: oneDayAgo },
+    _id: { $ne: 'keep-alive-config' }, // Don't delete config
+  });
+  return result;
+}

@@ -26,7 +26,7 @@ import {
 } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule, saveKeepAliveLog, getKeepAliveLogs, getLatestKeepAliveLog,
-         saveKeepAliveConfig, getKeepAliveConfig } from './db.js';
+         saveKeepAliveConfig, getKeepAliveConfig, deleteOldKeepAliveLogs } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3001);
@@ -245,9 +245,23 @@ async function validateCookieLive(cookieStr, proxy = '') {
       timeout: 25_000,
       ...proxyOpts,
     });
+    
+    // Log response details for debugging
+    const statusOk = resp.status >= 200 && resp.status < 300;
+    const isJson = typeof resp.data === 'object' || (typeof resp.data === 'string' && resp.data?.trim().startsWith('{'));
+    console.log(`    [validate] ${url.split('/').pop()}: status=${resp.status}, isJson=${isJson}, hasData=${!!resp.data}`);
+    
     if (resp.data && typeof resp.data === 'object') return resp.data;
     const text = typeof resp.data === 'string' ? resp.data : '';
-    try { return JSON.parse(text); } catch { return null; }
+    try { 
+      const parsed = JSON.parse(text);
+      return parsed;
+    } catch (e) {
+      if (text) {
+        console.log(`    [validate] JSON parse failed: ${text.substring(0, 100)}`);
+      }
+      return null;
+    }
   };
 
   const urls = [
@@ -265,15 +279,41 @@ async function validateCookieLive(cookieStr, proxy = '') {
       let data = null;
       try {
         data = await tryFetch(url, xsrf);
-      } catch {
+      } catch (err) {
+        lastMessage = `${url.split('/').pop()}: ${String(err?.message ?? err)}`;
+        console.log(`    [validate] ${url.split('/').pop()} threw: ${lastMessage}`);
         continue;
       }
 
-      const user = data?.data?.user ?? data?.user ?? data?.data?.list?.[0]?.user ?? null;
-      if (user?.id || user?.idstr || user?.screen_name) {
+      if (!data) {
+        console.log(`    [validate] ${url.split('/').pop()} returned null data`);
+        continue;
+      }
+
+      // Log the actual response structure for debugging
+      const dataKeys = Object.keys(data ?? {}).slice(0, 10).join(', ');
+      const dataStr = JSON.stringify(data).substring(0, 150);
+      console.log(`    [validate] ${url.split('/').pop()} keys=[${dataKeys}...] data=${dataStr}...`);
+
+      // Try multiple response structure patterns
+      let user = data?.data?.user ?? data?.user ?? data?.data?.list?.[0]?.user ?? null;
+      
+      // Additional fallback patterns for different Weibo API versions
+      if (!user && data?.data) {
+        if (typeof data.data === 'object' && !Array.isArray(data.data)) {
+          user = data.data;
+        } else if (Array.isArray(data.data) && data.data[0]) {
+          user = data.data[0]?.user || data.data[0];
+        }
+      }
+      
+      // Check for uid-like fields to validate user data
+      const hasUserId = user?.id || user?.idstr || user?.uid || user?.screen_name;
+      if (hasUserId) {
+        console.log(`    [validate] ✓ Found user: ${user.screen_name || user.idstr || user.id || user.uid}`);
         return {
           valid: true,
-          uid: user.id ?? user.idstr ?? null,
+          uid: user.id ?? user.idstr ?? user.uid ?? null,
           name: user.screen_name ?? user.name ?? '已验证',
           avatar: user.profile_image_url ?? null,
           reason: null,
@@ -281,6 +321,7 @@ async function validateCookieLive(cookieStr, proxy = '') {
       }
 
       if (data?.ok === 1 && data?.data) {
+        console.log(`    [validate] ✓ Found ok=1 with data`);
         return {
           valid: true,
           uid: null,
@@ -290,8 +331,23 @@ async function validateCookieLive(cookieStr, proxy = '') {
         };
       }
 
+      // Check for rate limit or other specific errors
+      if (data?.ok === 0 && data?.errno === 10017) {
+        console.log(`    [validate] Found rate limit (errno=10017)`);
+        seenDataFetchRestricted = true;
+      }
+
+      // Check for Weibo's "not authenticated" error responses
+      if (data?.ok === -100 || data?.url?.includes('login.php')) {
+        console.log(`    [validate] ✗ Not authenticated (ok=-100 or redirect to login)`);
+        seenLoginError = true;
+      }
+
       const msg = String(data?.msg ?? data?.message ?? data?.error ?? '').trim();
-      if (msg) lastMessage = msg;
+      if (msg) {
+        lastMessage = msg;
+        console.log(`    [validate] Error message: ${msg}`);
+      }
       
       // Track if we got any HTTP 200 response (not a network error)
       if (data !== null) seenHttpSuccess = true;
@@ -309,6 +365,7 @@ async function validateCookieLive(cookieStr, proxy = '') {
   // This indicates the account is logged in but the API is rate-limited.
   // If we got zero user data and login errors, the cookie is invalid.
   if (seenDataFetchRestricted && !seenLoginError && seenHttpSuccess) {
+    console.log(`    [validate] ✓ Detected rate limiting with valid session (10017)`);
     return {
       valid: true,
       uid: null,
@@ -318,6 +375,8 @@ async function validateCookieLive(cookieStr, proxy = '') {
     };
   }
 
+  console.log(`    [validate] ✗ Validation failed: seenHttpSuccess=${seenHttpSuccess}, seenLoginError=${seenLoginError}, seenDataFetchRestricted=${seenDataFetchRestricted}, lastMessage="${lastMessage}"`);
+
   return {
     valid: false,
     uid: null,
@@ -325,7 +384,7 @@ async function validateCookieLive(cookieStr, proxy = '') {
     avatar: null,
     reason: seenLoginError
       ? (lastMessage || 'Cookie 无效或已过期')
-      : (lastMessage ? `验证失败: ${lastMessage}` : '服务器返回非预期响应，请检查代理或网络'),
+      : (lastMessage ? `验证失败: ${lastMessage}` : '未在响应中找到用户信息（API结构不符合预期）'),
   };
 }
 
@@ -573,8 +632,25 @@ app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
     let live = { valid: false, uid: null, name: null, avatar: null, reason: '未校验' };
     try {
       live = await validateCookieLive(refreshed.cookie, accounts[idx]?.proxy ?? '');
+      console.log(`[refresh-cookie] account-${idx + 1} validation result: valid=${live.valid}, reason=${live.reason || 'none'}`);
     } catch (e) {
       live = { valid: false, uid: null, name: null, avatar: null, reason: `刷新后校验失败: ${e.message}` };
+      console.error(`[refresh-cookie] account-${idx + 1} validation error:`, e.message);
+    }
+
+    // If validation failed and cookies appear to be invalid (not authenticated),
+    // offer QR login as fallback to get fresh cookies
+    if (!live.valid && live.reason && /未登录|not authenticated|login.php|已过期|无效/i.test(live.reason)) {
+      console.log(`[refresh-cookie] account-${idx + 1} extracted cookies invalid, suggesting QR login fallback`);
+      // Still save whatever cookies we got, but flag for QR login
+      const updated = accounts.map((a, i) => (i === idx ? { ...a } : a));
+      await setAccounts(updated);
+      return res.status(409).json({
+        ok: false,
+        error: `提取的 Cookie 经验证失败: ${live.reason}。请使用二维码登录重新获取有效 Cookie。`,
+        errorType: 'requires_qr_login',
+        requiresQr: true,
+      });
     }
 
     const updated = accounts.map((a, i) => (i === idx ? {
@@ -1823,29 +1899,58 @@ async function startCookieKeepAlive() {
       console.log(`📋 Processing ${accounts.length} accounts...`);
       
       const results = await keepAliveAllAccounts(accounts);
+      
+      // Validate extracted cookies before saving them
+      const validatedResults = [];
+      console.log(`[keep-alive] Validating ${results.length} extraction results...`);
+      for (const r of results) {
+        if (!r.ok || !r.cookie) {
+          console.log(`[keep-alive] account-${r.accountIndex + 1}: skipping (ok=${r.ok}, hasCookie=${!!r.cookie})`);
+          validatedResults.push(r);
+          continue;
+        }
+        
+        // Do a quick validation on the extracted cookie
+        try {
+          console.log(`[keep-alive] account-${r.accountIndex + 1}: validating extracted cookie...`);
+          const validation = await validateCookieLive(r.cookie, accounts[r.accountIndex]?.proxy ?? '');
+          if (validation.valid) {
+            validatedResults.push(r);
+            console.log(`    [keep-alive validation] account-${r.accountIndex + 1}: ✓ ${validation.name}`);
+          } else {
+            console.log(`    [keep-alive validation] account-${r.accountIndex + 1}: ✗ ${validation.reason}`);
+            validatedResults.push({ ...r, ok: false, error: `VALIDATION_FAILED: ${validation.reason}` });
+          }
+        } catch (err) {
+          console.error(`    [keep-alive validation] account-${r.accountIndex + 1}: error: ${err.message}`);
+          validatedResults.push({ ...r, ok: false, error: `VALIDATION_ERROR: ${String(err?.message ?? err)}` });
+        }
+      }
+      
       const updated = accounts.map((a, i) => {
-        const r = results.find(x => x.accountIndex === i);
+        const r = validatedResults.find(x => x.accountIndex === i);
         return r?.ok && r.cookie ? { ...a, cookie: r.cookie } : a;
       });
       await setAccounts(updated);
       
       keepAliveLog = {
         ranAt: runStartTime,
-        results: results.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
+        results: validatedResults.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
       };
       
       // Save to MongoDB if configured
       await saveKeepAliveLog(keepAliveLog).catch(err => console.error('Failed to save keep-alive log:', err.message));
       
-      const ok = results.filter(r => r.ok).length;
-      const fail = results.filter(r => !r.ok).length;
-      const noProfile = results.filter(r => r.error === 'no_profile').length;
-      const otherFail = fail - noProfile;
+      const ok = validatedResults.filter(r => r.ok).length;
+      const fail = validatedResults.filter(r => !r.ok).length;
+      const noProfile = validatedResults.filter(r => r.error === 'no_profile').length;
+      const validationFails = validatedResults.filter(r => r.error?.includes('VALIDATION')).length;
+      const otherFail = fail - noProfile - validationFails;
       
       const runEndTime = new Date().toISOString();
       const duration = Math.round((new Date(runEndTime) - new Date(runStartTime)) / 1000);
       const memAfter = process.memoryUsage();
-      console.log(`✅ Keep-alive run completed in ${duration}s: ${ok} refreshed, ${fail} failed (${noProfile} no_profile, ${otherFail} errors)`);
+      console.log(`✅ Keep-alive run completed in ${duration}s: ${ok} valid, ${validationFails} validation failures, ${fail} failed (${noProfile} no_profile, ${otherFail} errors)`);
       console.log(`💾 Memory after: RSS=${Math.round(memAfter.rss / 1024 / 1024)}MB, Heap=${Math.round(memAfter.heapUsed / 1024 / 1024)}MB/${Math.round(memAfter.heapTotal / 1024 / 1024)}MB`);
       console.log(`   Finished at ${runEndTime}\n`);
     } catch (err) {
@@ -1862,6 +1967,27 @@ async function startCookieKeepAlive() {
   console.log(`Cookie keep-alive: first run in ${Math.round(KEEP_ALIVE_FIRST_DELAY_MS / 3_600_000 * 10) / 10}h, then every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 3_600_000 * 10) / 10}h`);
   keepAliveTimeoutId = setTimeout(() => { void run(); }, KEEP_ALIVE_FIRST_DELAY_MS);
   keepAliveIntervalId = setInterval(() => { void run(); }, KEEP_ALIVE_INTERVAL_MS);
+}
+
+// ── Keep-alive log cleanup ─────────────────────────────────
+async function startKeepAliveLogCleanup() {
+  const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  
+  const cleanup = async () => {
+    try {
+      const result = await deleteOldKeepAliveLogs();
+      if (result.deletedCount > 0) {
+        console.log(`🗑️  Keep-alive log cleanup: deleted ${result.deletedCount} logs older than 24 hours`);
+      }
+    } catch (err) {
+      console.error(`❌ Keep-alive log cleanup failed: ${err.message}`);
+    }
+  };
+
+  // Run cleanup every 24 hours (offset by 12h from keep-alive to distribute load)
+  console.log(`Cookie keep-alive log cleanup: running every 24 hours`);
+  setTimeout(() => { void cleanup(); }, 12 * 60 * 60 * 1000); // First run after 12h
+  setInterval(() => { void cleanup(); }, CLEANUP_INTERVAL_MS);
 }
 
 // ── start ─────────────────────────────────────────────────
@@ -1898,6 +2024,12 @@ async function start() {
       await startCookieKeepAlive();
     } catch (err) {
       console.error(`❌ Failed to start cookie keep-alive: ${err.message}`);
+      console.error(err.stack);
+    }
+    try {
+      startKeepAliveLogCleanup();
+    } catch (err) {
+      console.error(`❌ Failed to start keep-alive log cleanup: ${err.message}`);
       console.error(err.stack);
     }
   });

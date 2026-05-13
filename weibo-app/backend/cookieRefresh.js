@@ -25,8 +25,9 @@
  * 
  * 5. BROWSER PROFILE PERSISTENCE
  *    - Uses Playwright persistent contexts with saved auth profiles
- *    - Profile directory structure: ~/.auth-profiles/account-{index}-{name}/
+ *    - Profile directory structure: ~/.auth-profiles/account-{index}/
  *    - Stores all cookies, cache, and session state across refreshes
+ *    - Automatic migration from old {index}-{name} format to index-only on startup
  * 
  * 6. KEEP-ALIVE SCHEDULING
  *    - Default: first refresh 6h after startup, then every 24h
@@ -126,7 +127,8 @@ async function readQrImageDataUrl(context, page) {
   let src = '';
   for (const sel of selectors) {
     try {
-      await page.waitForSelector(sel, { timeout: 9000 });
+      // Reduced from 9s to 5s — QR image usually renders within 2-3s for local connections
+      await page.waitForSelector(sel, { timeout: 5000 });
       src = await page.$eval(sel, node => String(node.getAttribute('src') ?? '').trim());
       if (src) break;
     } catch {
@@ -208,13 +210,29 @@ export async function startQrLoginSession({ accountIndex, accountName = '', prox
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const proxyConfig = parsePlaywrightProxy(proxy);
-  const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+  // Reduced timeouts: 30s for local (usually loads in 5-15s), 60s for proxy (more unpredictable)
+  const navTimeoutMs = proxyConfig ? 60_000 : 30_000;
   const edgePath = getEdgeExecutablePath();
-  const context = await chromium.launchPersistentContext(userDataDir, {
+  
+  // Add timeout to browser launch
+  let launchTimeoutId;
+  const launchPromise = chromium.launchPersistentContext(userDataDir, {
     headless: true,
     executablePath: edgePath || undefined,
     proxy: proxyConfig || undefined,
   });
+  
+  const launchWithTimeout = Promise.race([
+    launchPromise,
+    new Promise((_, reject) => {
+      launchTimeoutId = setTimeout(
+        () => reject(new Error('Browser launch timeout (45s) — profile may be corrupted')),
+        45_000
+      );
+    })
+  ]).finally(() => clearTimeout(launchTimeoutId));
+  
+  const context = await launchWithTimeout;
 
   try {
     await context.clearCookies();
@@ -325,8 +343,9 @@ function slugify(v) {
 }
 
 function profileDirForAccount(accountIndex, accountName) {
-  const safeName = slugify(accountName);
-  const key = safeName ? `account-${accountIndex + 1}-${safeName}` : `account-${accountIndex + 1}`;
+  // Use index-only naming (robust to name changes)
+  // Old format: account-1-name -> New format: account-1
+  const key = `account-${accountIndex + 1}`;
   return path.join(AUTH_DIR, key);
 }
 
@@ -437,6 +456,9 @@ function clearChromiumLocks(userDataDir) {
     path.join(userDataDir, 'SingletonSocket'),
     path.join(userDataDir, 'SingletonCookie'),
     path.join(userDataDir, 'lockfile'),
+    path.join(userDataDir, '.refresh.lock'),
+    path.join(userDataDir, 'Default', 'Cookies-journal'),
+    path.join(userDataDir, 'Default', 'Preferences-journal'),
   ];
   for (const f of lockFiles) {
     try { fs.unlinkSync(f); } catch {}
@@ -455,6 +477,56 @@ async function withProfileLock(userDataDir, fn) {
   }
 }
 
+// ── Profile Directory Migration ─────────────────────────────────────────────
+// Migrate old format (account-N-{name}) to new format (account-N)
+async function migrateProfileDirectories() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  
+  try {
+    const entries = fs.readdirSync(AUTH_DIR, { withFileTypes: true });
+    let migratedCount = 0;
+    
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      
+      // Match old format: account-N-{anything}
+      const match = name.match(/^account-(\d+)(?:-.*)?$/);
+      if (!match) continue;
+      
+      const newName = `account-${match[1]}`;
+      
+      // Skip if already in new format
+      if (name === newName) continue;
+      
+      // Check if new format already exists
+      const oldPath = path.join(AUTH_DIR, name);
+      const newPath = path.join(AUTH_DIR, newName);
+      
+      if (fs.existsSync(newPath)) {
+        // New format exists, remove old one
+        fs.rmSync(oldPath, { recursive: true, force: true });
+        console.log(`  [migration] removed old profile ${name} (new format ${newName} exists)`);
+        migratedCount++;
+      } else {
+        // Rename old to new
+        fs.renameSync(oldPath, newPath);
+        console.log(`  [migration] renamed ${name} → ${newName}`);
+        migratedCount++;
+      }
+    }
+    
+    if (migratedCount > 0) {
+      console.log(`✅ Profile migration: ${migratedCount} directories updated to index-only format`);
+    }
+  } catch (err) {
+    console.warn(`⚠️  Profile migration failed: ${err.message}`);
+  }
+}
+
+// Run migration on module load
+migrateProfileDirectories().catch(err => console.error('Migration error:', err));
+
 /**
  * Headless refresh: reuses the existing persistent profile so no manual login is needed.
  * Navigates to weibo.com and extracts the session cookies from the saved profile.
@@ -462,16 +534,32 @@ async function withProfileLock(userDataDir, fn) {
  */
 async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
   const proxyConfig = parsePlaywrightProxy(proxy);
-  const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+  // Reduced timeouts: 30s for local (usually loads in 5-15s), 60s for proxy (more unpredictable)
+  const navTimeoutMs = proxyConfig ? 60_000 : 30_000;
   let context;
   try {
     clearChromiumLocks(userDataDir);
     const edgePath = getEdgeExecutablePath();
-    context = await chromium.launchPersistentContext(userDataDir, {
+    
+    // Add timeout to browser launch (prevents infinite hang on corrupted profiles)
+    let launchTimeoutId;
+    const launchPromise = chromium.launchPersistentContext(userDataDir, {
       headless: true,
       executablePath: edgePath || undefined,
       proxy: proxyConfig || undefined,
     });
+    
+    const launchWithTimeout = Promise.race([
+      launchPromise,
+      new Promise((_, reject) => {
+        launchTimeoutId = setTimeout(
+          () => reject(new Error('Browser launch timeout (45s) — profile may be corrupted')),
+          45_000
+        );
+      })
+    ]).finally(() => clearTimeout(launchTimeoutId));
+    
+    context = await launchWithTimeout;
 
     // Lightweight session touch: avoids expensive homepage assets over proxy.
     try {
@@ -529,17 +617,33 @@ async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
  */
 async function refreshCookieWithVisibleBrowser({ userDataDir, proxy = '', maxWaitMs = 180000 }) {
   const proxyConfig = parsePlaywrightProxy(proxy);
-  const navTimeoutMs = proxyConfig ? 120_000 : 75_000;
+  // Reduced timeouts: 30s for local (usually loads in 5-15s), 60s for proxy (more unpredictable)
+  const navTimeoutMs = proxyConfig ? 60_000 : 30_000;
   let context;
   try {
     clearChromiumLocks(userDataDir);
     const edgePath = getEdgeExecutablePath();
-    context = await chromium.launchPersistentContext(userDataDir, {
+    
+    // Add timeout to browser launch
+    let launchTimeoutId;
+    const launchPromise = chromium.launchPersistentContext(userDataDir, {
       headless: false,
       executablePath: edgePath || undefined,
       viewport: { width: 1280, height: 900 },
       proxy: proxyConfig || undefined,
     });
+    
+    const launchWithTimeout = Promise.race([
+      launchPromise,
+      new Promise((_, reject) => {
+        launchTimeoutId = setTimeout(
+          () => reject(new Error('Browser launch timeout (45s) — profile may be corrupted')),
+          45_000
+        );
+      })
+    ]).finally(() => clearTimeout(launchTimeoutId));
+    
+    context = await launchWithTimeout;
 
     // Clear stale cookies so the user sees a fresh login page.
     await context.clearCookies();
@@ -860,8 +964,16 @@ export async function keepAliveAllAccounts(accounts) {
       const refreshed = await withProfileLock(userDataDir, () =>
         refreshCookieHeadless({ userDataDir, proxy })
       );
-      console.log(`  ✅ ${acctLabel}: success (cookie updated)`);
-      results.push({ accountIndex: i, accountName: name, ok: true, cookie: refreshed.cookie });
+      
+      // Validate the extracted cookies before marking as success
+      const cookieValidation = await validateCookieBasic(refreshed.cookie);
+      if (!cookieValidation.valid) {
+        console.log(`  ⚠️  ${acctLabel}: extracted cookie invalid (${cookieValidation.reason})`);
+        results.push({ accountIndex: i, accountName: name, ok: false, error: `EXTRACTED_COOKIE_INVALID: ${cookieValidation.reason}` });
+      } else {
+        console.log(`  ✅ ${acctLabel}: success (cookie updated, health: ${cookieValidation.health})`);
+        results.push({ accountIndex: i, accountName: name, ok: true, cookie: refreshed.cookie });
+      }
     } catch (e) {
       const error = isNavigationTimeoutError(e) ? 'NETWORK_TIMEOUT' : e.message;
       console.log(`  ❌ ${acctLabel}: ${error}`);
@@ -912,7 +1024,7 @@ async function validateCookieBasic(cookieStr) {
 /**
  * Main entry point.
  * - If the account profile already has a saved session, tries a headless refresh first.
- * - Falls back to a visible browser only when no session exists or the session has expired.
+ * - Falls back to QR login if headless refresh fails for any reason.
  */
 export async function refreshCookieViaManualLogin({ accountIndex, accountName = '', proxy = '', maxWaitMs = 180000, allowVisibleBrowser = false }) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -925,10 +1037,9 @@ export async function refreshCookieViaManualLogin({ accountIndex, accountName = 
       try {
         return await refreshCookieHeadless({ userDataDir, proxy });
       } catch (e) {
-        if (e.message === 'SESSION_EXPIRED') {
-          throw new Error(explainHeadfulNotAvailable('Cookie 已过期，请改用页面二维码登录刷新'));
-        }
-        throw e;
+        // Headless refresh failed (SESSION_EXPIRED, network error, etc.) → fall back to QR login
+        console.log(`[cookieRefresh] account-${accountIndex + 1} headless refresh failed: ${e.message}, falling back to QR login`);
+        throw new Error(explainHeadfulNotAvailable('Cookie 已过期或无法刷新，请改用页面二维码登录'));
       }
     }
 
