@@ -1838,13 +1838,14 @@ async function startCookieKeepAlive() {
       await saveKeepAliveLog(keepAliveLog).catch(err => console.error('Failed to save keep-alive log:', err.message));
       
       const ok = results.filter(r => r.ok).length;
-      const fail = results.filter(r => !r.ok && r.error !== 'no_profile').length;
+      const fail = results.filter(r => !r.ok).length;
       const noProfile = results.filter(r => r.error === 'no_profile').length;
+      const otherFail = fail - noProfile;
       
       const runEndTime = new Date().toISOString();
       const duration = Math.round((new Date(runEndTime) - new Date(runStartTime)) / 1000);
       const memAfter = process.memoryUsage();
-      console.log(`✅ Keep-alive run completed in ${duration}s: ${ok} refreshed, ${fail} failed, ${noProfile} no_profile`);
+      console.log(`✅ Keep-alive run completed in ${duration}s: ${ok} refreshed, ${fail} failed (${noProfile} no_profile, ${otherFail} errors)`);
       console.log(`💾 Memory after: RSS=${Math.round(memAfter.rss / 1024 / 1024)}MB, Heap=${Math.round(memAfter.heapUsed / 1024 / 1024)}MB/${Math.round(memAfter.heapTotal / 1024 / 1024)}MB`);
       console.log(`   Finished at ${runEndTime}\n`);
     } catch (err) {
