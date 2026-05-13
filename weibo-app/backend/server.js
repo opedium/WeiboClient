@@ -44,6 +44,9 @@ const PUBLIC_ROUTES = new Set(['/api/login', '/api/logout', '/api/me', '/api/hea
 const MONGODB_URI = String(process.env.MONGODB_URI ?? '').trim();
 const COOKIE_SECRET = String(process.env.COOKIE_SECRET ?? '').trim();
 
+// Track server startup time for crash detection
+let SERVER_STARTUP_TIME = null;
+
 function safeTokenEqual(a, b) {
   const aa = Buffer.from(String(a ?? ''), 'utf8');
   const bb = Buffer.from(String(b ?? ''), 'utf8');
@@ -1642,6 +1645,8 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     authRequired: AUTH_REQUIRED,
     corsMode: CORS_ALLOW_ALL ? 'allow_all' : 'allow_list',
+    serverStartupTime: SERVER_STARTUP_TIME,
+    currentTime: new Date().toISOString(),
   });
 });
 
@@ -1804,26 +1809,51 @@ async function startCookieKeepAlive() {
   }
 
   const run = async () => {
+    const runStartTime = new Date().toISOString();
+    const memBefore = process.memoryUsage();
+    console.log(`\n⏱️  Keep-alive run started at ${runStartTime}`);
+    console.log(`💾 Memory before: RSS=${Math.round(memBefore.rss / 1024 / 1024)}MB, Heap=${Math.round(memBefore.heapUsed / 1024 / 1024)}MB/${Math.round(memBefore.heapTotal / 1024 / 1024)}MB`);
+    
     try {
       const accounts = await getAccounts();
-      if (!accounts.length) return;
+      if (!accounts.length) {
+        console.log('⚠️  No accounts found, skipping keep-alive');
+        return;
+      }
+      console.log(`📋 Processing ${accounts.length} accounts...`);
+      
       const results = await keepAliveAllAccounts(accounts);
       const updated = accounts.map((a, i) => {
         const r = results.find(x => x.accountIndex === i);
         return r?.ok && r.cookie ? { ...a, cookie: r.cookie } : a;
       });
       await setAccounts(updated);
+      
       keepAliveLog = {
-        ranAt: new Date().toISOString(),
+        ranAt: runStartTime,
         results: results.map(({ accountIndex, accountName, ok, error }) => ({ accountIndex, accountName, ok, error: error ?? null })),
       };
+      
       // Save to MongoDB if configured
       await saveKeepAliveLog(keepAliveLog).catch(err => console.error('Failed to save keep-alive log:', err.message));
+      
       const ok = results.filter(r => r.ok).length;
       const fail = results.filter(r => !r.ok && r.error !== 'no_profile').length;
-      if (ok || fail) console.log(`Cookie keep-alive: ${ok} refreshed, ${fail} failed`);
+      const noProfile = results.filter(r => r.error === 'no_profile').length;
+      
+      const runEndTime = new Date().toISOString();
+      const duration = Math.round((new Date(runEndTime) - new Date(runStartTime)) / 1000);
+      const memAfter = process.memoryUsage();
+      console.log(`✅ Keep-alive run completed in ${duration}s: ${ok} refreshed, ${fail} failed, ${noProfile} no_profile`);
+      console.log(`💾 Memory after: RSS=${Math.round(memAfter.rss / 1024 / 1024)}MB, Heap=${Math.round(memAfter.heapUsed / 1024 / 1024)}MB/${Math.round(memAfter.heapTotal / 1024 / 1024)}MB`);
+      console.log(`   Finished at ${runEndTime}\n`);
     } catch (err) {
-      console.error('Cookie keep-alive failed:', err.message);
+      const runEndTime = new Date().toISOString();
+      const duration = Math.round((new Date(runEndTime) - new Date(runStartTime)) / 1000);
+      const memError = process.memoryUsage();
+      console.error(`❌ Keep-alive run failed after ${duration}s at ${runEndTime}: ${err.message}`);
+      console.error(`💾 Memory at error: RSS=${Math.round(memError.rss / 1024 / 1024)}MB, Heap=${Math.round(memError.heapUsed / 1024 / 1024)}MB/${Math.round(memError.heapTotal / 1024 / 1024)}MB`);
+      console.error(err.stack);
     }
   };
 
@@ -1835,6 +1865,12 @@ async function startCookieKeepAlive() {
 
 // ── start ─────────────────────────────────────────────────
 async function start() {
+  SERVER_STARTUP_TIME = new Date().toISOString();
+  const startupTime = SERVER_STARTUP_TIME;
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🚀 Backend startup: ${startupTime}`);
+  console.log(`${'='.repeat(60)}\n`);
+
   if (AUTH_REQUIRED && !AUTH_TOKEN) {
     throw new Error('AUTH_REQUIRED=true but AUTH_TOKEN is empty. Refusing to start.');
   }
@@ -1855,20 +1891,53 @@ async function start() {
   }
 
   const server = app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`Weibo backend running on http://0.0.0.0:${PORT}`);
+    console.log(`✅ Weibo backend listening on http://0.0.0.0:${PORT}`);
     startScheduler();
-    await startCookieKeepAlive();
+    try {
+      await startCookieKeepAlive();
+    } catch (err) {
+      console.error(`❌ Failed to start cookie keep-alive: ${err.message}`);
+      console.error(err.stack);
+    }
   });
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is already in use. Stop the conflicting process or set PORT to a different value.`);
+      console.error(`❌ Port ${PORT} is already in use. Stop the conflicting process or set PORT to a different value.`);
       process.exit(1);
     } else {
-      console.error(err);
+      console.error(`❌ Server error: ${err.message}`);
+      console.error(err.stack);
       process.exit(1);
     }
   });
+
+  // Graceful shutdown handlers
+  process.on('SIGTERM', () => {
+    console.log(`\n⚠️  SIGTERM received at ${new Date().toISOString()}, gracefully shutting down...`);
+    server.close(() => process.exit(0));
+  });
+
+  process.on('SIGINT', () => {
+    console.log(`\n⚠️  SIGINT received at ${new Date().toISOString()}, gracefully shutting down...`);
+    server.close(() => process.exit(0));
+  });
+
+  // Catch uncaught exceptions
+  process.on('uncaughtException', (err) => {
+    console.error(`\n❌ Uncaught exception at ${new Date().toISOString()}: ${err.message}`);
+    console.error(err.stack);
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error(`\n❌ Unhandled rejection at ${new Date().toISOString()}: ${reason}`);
+    console.error(promise);
+  });
 }
 
-start().catch(err => { console.error('Failed to start:', err.message); process.exit(1); });
+start().catch(err => { 
+  console.error(`❌ Failed to start at ${new Date().toISOString()}: ${err.message}`);
+  console.error(err.stack);
+  process.exit(1); 
+});

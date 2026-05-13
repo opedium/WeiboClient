@@ -745,21 +745,40 @@ export async function cancelCaptchaSession(sessionId) {
  */
 export async function keepAliveAllAccounts(accounts) {
   const results = [];
+  // Process accounts sequentially with delay to prevent memory exhaustion
+  // (Fixes OOM crashes on servers with limited memory)
+  const DELAY_BETWEEN_REFRESHES_MS = 2000; // 2s between account refreshes
+  
   for (let i = 0; i < accounts.length; i++) {
     const { name = '', proxy = '' } = accounts[i];
     const userDataDir = profileDirForAccount(i, name);
+    const acctLabel = `账号 ${i + 1}(${name})`;
+    
     if (!profileHasSession(userDataDir)) {
+      console.log(`  ⚠️  ${acctLabel}: no_profile (${userDataDir})`);
       results.push({ accountIndex: i, accountName: name, ok: false, error: 'no_profile' });
+      // Small delay even for no_profile to avoid hammering system
+      if (i < accounts.length - 1) {
+        await new Promise(r => setTimeout(r, 500));
+      }
       continue;
     }
     try {
       const refreshed = await withProfileLock(userDataDir, () =>
         refreshCookieHeadless({ userDataDir, proxy })
       );
+      console.log(`  ✅ ${acctLabel}: success (cookie updated)`);
       results.push({ accountIndex: i, accountName: name, ok: true, cookie: refreshed.cookie });
     } catch (e) {
       const error = isNavigationTimeoutError(e) ? 'NETWORK_TIMEOUT' : e.message;
+      console.log(`  ❌ ${acctLabel}: ${error}`);
       results.push({ accountIndex: i, accountName: name, ok: false, error });
+    }
+    
+    // Delay between refreshes to let memory be reclaimed
+    if (i < accounts.length - 1) {
+      console.log(`  ⏳ Waiting ${DELAY_BETWEEN_REFRESHES_MS}ms before next account...`);
+      await new Promise(r => setTimeout(r, DELAY_BETWEEN_REFRESHES_MS));
     }
   }
   return results;
