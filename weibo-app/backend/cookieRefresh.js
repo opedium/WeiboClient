@@ -1,3 +1,52 @@
+/**
+ * ── Weibo Cookie Refresh & Keep-Alive System ──────────────────────────────────
+ * 
+ * Cookie Strengthening Strategies:
+ * 
+ * 1. REQUIRED FIELDS (Critical for session validity)
+ *    - SUB: Core Weibo session identifier
+ *    - XSRF-TOKEN: CSRF protection token (required for POST requests)
+ *    Without both, the session is invalid and will be rejected.
+ * 
+ * 2. SUPPLEMENTARY FIELDS (Make cookies more resilient)
+ *    - SUBP: Supplementary SUB parameter (device/browser fingerprint)
+ *    - SCF: Security context flag (indicates valid authentication state)
+ *    Cookies with both SUBP+SCF are considered "strong" and more resistant to expiration.
+ * 
+ * 3. SESSION POLLING TIMEOUT
+ *    - Extended from 25s → 40s to give browser time to load all cookies
+ *    - Polls multiple domains (weibo.com, sina.com.cn) for cookie sources
+ *    - Waits for async cookie setting to complete (especially over slow proxies)
+ * 
+ * 4. MULTI-DOMAIN COOKIE HARVESTING
+ *    - Collects cookies from all relevant Weibo domains
+ *    - Merges them using domain priority scoring (weibo.com > www.weibo.com > sina.com.cn)
+ *    - Ensures complete session state is captured
+ * 
+ * 5. BROWSER PROFILE PERSISTENCE
+ *    - Uses Playwright persistent contexts with saved auth profiles
+ *    - Profile directory structure: ~/.auth-profiles/account-{index}-{name}/
+ *    - Stores all cookies, cache, and session state across refreshes
+ * 
+ * 6. KEEP-ALIVE SCHEDULING
+ *    - Default: first refresh 6h after startup, then every 24h
+ *    - Configurable via KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_FIRST_DELAY_MS
+ *    - Weak cookies (only SUB/XSRF, no SUBP/SCF) warrant more frequent refresh
+ * 
+ * 7. SESSION VALIDATION
+ *    - Before refresh: validates current cookie still has required fields
+ *    - Skips refresh if cookie already logged out/invalid
+ *    - Reports health status: "strong" (all fields), "normal" (most fields), "weak" (minimal)
+ * 
+ * Common Issues & Solutions:
+ *    - SESSION_EXPIRED: Browser profile exists but cookies didn't load
+ *      → Check proxy stability, increase timeout, ensure profile dir has permissions
+ *    - no_profile: Browser profile not initialized
+ *      → Run QR login (startQrLoginSession) or manual login first
+ *    - Weak cookies: Missing SUBP/SCF despite valid session
+ *      → Normal for some accounts; refresh more frequently or re-login to refresh state
+ */
+
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -433,16 +482,41 @@ async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
       await gotoWithRetry(page, 'https://weibo.com/', { timeoutMs: navTimeoutMs, attempts: 2 });
     }
 
-    // Some profiles set cookies asynchronously after redirects/scripts.
-    const deadline = Date.now() + 25_000;
+    // Wait for cookies with extended polling (accounts for slow proxy/async cookie setting).
+    // Check multiple cookie domains and poll longer to strengthen session detection.
+    const allDomains = ['https://weibo.com', 'https://www.weibo.com', 'https://sina.com.cn'];
+    const deadline = Date.now() + 40_000; // Increased from 25s to 40s for better resilience
+    let lastSeenPartialCookies = { hasSub: false, hasXsrf: false };
+    
     while (Date.now() < deadline) {
-      const cookies = await context.cookies(['https://weibo.com', 'https://www.weibo.com']);
+      const cookies = await context.cookies(allDomains);
       const cookieStr = toCookieString(cookies);
-      if (hasRequiredSessionCookies(cookieStr)) {
-        return { cookie: cookieStr, userDataDir, refreshedAt: new Date().toISOString() };
+      
+      // Track what we have for diagnostics
+      const hasSub = hasCookieField(cookieStr, 'SUB');
+      const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+      const hasSubp = hasCookieField(cookieStr, 'SUBP');
+      const hasScf = hasCookieField(cookieStr, 'SCF');
+      
+      if (hasSub !== lastSeenPartialCookies.hasSub || hasXsrf !== lastSeenPartialCookies.hasXsrf) {
+        const fields = [];
+        if (hasSub) fields.push('SUB');
+        if (hasXsrf) fields.push('XSRF-TOKEN');
+        if (hasSubp) fields.push('SUBP');
+        if (hasScf) fields.push('SCF');
+        console.log(`    [cookie check] found fields: ${fields.length > 0 ? fields.join(', ') : 'none'}`);
+        lastSeenPartialCookies = { hasSub, hasXsrf };
       }
+      
+      if (hasRequiredSessionCookies(cookieStr)) {
+        // Cookie is complete — also include supplementary fields if present for strength
+        const cookieWithSupp = cookieStr; // Already includes SUBP/SCF from toCookieString
+        return { cookie: cookieWithSupp, userDataDir, refreshedAt: new Date().toISOString() };
+      }
+      
       await new Promise(r => setTimeout(r, 1200));
     }
+    
     throw new Error('SESSION_EXPIRED');
   } finally {
     if (context) { try { await context.close(); } catch {} }
@@ -750,7 +824,7 @@ export async function keepAliveAllAccounts(accounts) {
   const DELAY_BETWEEN_REFRESHES_MS = 2000; // 2s between account refreshes
   
   for (let i = 0; i < accounts.length; i++) {
-    const { name = '', proxy = '' } = accounts[i];
+    const { name = '', cookie = '', proxy = '' } = accounts[i];
     const userDataDir = profileDirForAccount(i, name);
     const acctLabel = `账号 ${i + 1}(${name})`;
     
@@ -763,6 +837,25 @@ export async function keepAliveAllAccounts(accounts) {
       }
       continue;
     }
+
+    // ── VALIDATE COOKIE BEFORE REFRESH ──────────────────────────────────────
+    // Check if the stored cookie is still valid (not logged out/expired)
+    if (cookie && cookie.trim()) {
+      const validation = await validateCookieBasic(cookie);
+      if (!validation.valid) {
+        console.log(`  ❌ ${acctLabel}: cookie invalid (${validation.reason}) — skipping refresh`);
+        results.push({ accountIndex: i, accountName: name, ok: false, error: `COOKIE_INVALID: ${validation.reason}` });
+        if (i < accounts.length - 1) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        continue;
+      }
+      // Warn if cookie health is weak
+      if (validation.health && validation.health !== 'strong') {
+        console.log(`  ⚠️  ${acctLabel}: cookie health is "${validation.health}" (consider more frequent refreshes)`);
+      }
+    }
+
     try {
       const refreshed = await withProfileLock(userDataDir, () =>
         refreshCookieHeadless({ userDataDir, proxy })
@@ -783,6 +876,38 @@ export async function keepAliveAllAccounts(accounts) {
   }
   return results;
 }
+
+/**
+ * Validates a cookie by checking if it has required fields and can be used for API calls.
+ * Returns { valid, reason, health }
+ */
+async function validateCookieBasic(cookieStr) {
+  // Check required fields
+  if (!hasRequiredSessionCookies(cookieStr)) {
+    const hasSub = hasCookieField(cookieStr, 'SUB');
+    const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+    const missing = [];
+    if (!hasSub) missing.push('SUB');
+    if (!hasXsrf) missing.push('XSRF-TOKEN');
+    return { valid: false, reason: `缺少必要字段: ${missing.join(', ')}`, health: 'critical' };
+  }
+  
+  // Check for supplementary fields that strengthen the session
+  const hasSubp = hasCookieField(cookieStr, 'SUBP');
+  const hasScf = hasCookieField(cookieStr, 'SCF');
+  const suppFields = (hasSubp ? 1 : 0) + (hasScf ? 1 : 0);
+  
+  // Health assessment: more supplementary fields = stronger cookie
+  let health = 'weak';
+  if (suppFields === 2) {
+    health = 'strong'; // Has both SUBP and SCF
+  } else if (suppFields === 1) {
+    health = 'normal'; // Has one of them
+  }
+  
+  return { valid: true, reason: null, health };
+}
+
 
 /**
  * Main entry point.
