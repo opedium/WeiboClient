@@ -844,6 +844,72 @@ app.post('/api/accounts/:index/qr-login/cancel', async (req, res) => {
   return res.json({ ok: true, ...result });
 });
 
+// ── Manual Cookie Upload (Fallback for Headless Systems) ──────
+// When QR login fails on headless servers, allow user to manually paste cookie string
+app.post('/api/accounts/:index/manual-cookie', async (req, res) => {
+  const idx = Number.parseInt(req.params.index, 10);
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+
+  const { cookie } = req.body ?? {};
+  if (!cookie || typeof cookie !== 'string') {
+    return res.status(400).json({ ok: false, error: '缺少 cookie 字段' });
+  }
+
+  const cookieStr = cookie.trim();
+  const check = checkCookieFields(cookieStr);
+  
+  if (check.missing.length) {
+    return res.json({
+      ok: false,
+      valid: false,
+      error: `Cookie 缺少必要字段: ${check.missing.join(', ')}`,
+      missing: check.missing,
+      missingRec: check.missingRec,
+    });
+  }
+
+  try {
+    const accounts = await getAccounts();
+    if (idx >= accounts.length) {
+      return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
+    }
+
+    let live = { valid: false, uid: null, name: null, avatar: null, reason: '未校验' };
+    try {
+      live = await validateCookieLive(cookieStr, accounts[idx]?.proxy ?? '');
+    } catch (e) {
+      live = { valid: false, uid: null, name: null, avatar: null, reason: `校验失败: ${e.message}` };
+    }
+
+    const updated = accounts.map((a, i) => (i === idx ? {
+      ...a,
+      cookie: cookieStr,
+      uid: live.valid && live.uid ? String(live.uid) : String(a.uid ?? '').trim(),
+    } : a));
+    await setAccounts(updated);
+    const clean = sanitizeAccountsForResponse(updated);
+
+    return res.json({
+      ok: true,
+      account: clean[idx],
+      validated: {
+        valid: !!live.valid,
+        uid: live.uid,
+        name: live.name,
+        avatar: live.avatar,
+        error: live.valid ? null : live.reason,
+        missingRec: check.missingRec,
+      },
+      message: live.valid ? 'Cookie 已保存并验证通过' : 'Cookie 已保存但验证失败（可能已过期）',
+    });
+  } catch (e) {
+    const classified = classifyBackendError(e);
+    return res.status(500).json({ ok: false, error: `${classified.reason}: ${classified.detail}`, errorType: classified.type });
+  }
+});
+
 // ── CAPTCHA Verification ─────────────────────────────────
 app.post('/api/accounts/:index/captcha/start', async (req, res) => {
   const idx = Number.parseInt(req.params.index, 10);

@@ -163,43 +163,126 @@ async function monitorQrSession(sessionId) {
   const session = qrSessions.get(sessionId);
   if (!session) return;
   const { context } = session;
+  const startTime = Date.now();
+  let pollCount = 0;
+  const accountLabel = `account-${session.accountIndex + 1}`;
 
   try {
-    while (true) {
-      const s = qrSessions.get(sessionId);
-      if (!s) return;
-      if (s.status === 'cancelled') return;
-      if (Date.now() > s.expiresAt) {
-        s.status = 'expired';
-        s.error = '二维码已过期，请重新获取';
-        s.completedAt = new Date().toISOString();
-        await closeQrSessionContext(sessionId);
-        return;
-      }
-
-      const cookies = await context.cookies([
-        'https://weibo.com',
-        'https://www.weibo.com',
-        'https://login.sina.com.cn',
-        'https://passport.weibo.com',
-      ]);
-      const cookieStr = toCookieString(cookies);
-      if (hasRequiredSessionCookies(cookieStr)) {
-        s.status = 'success';
-        s.cookie = cookieStr;
-        s.completedAt = new Date().toISOString();
-        await closeQrSessionContext(sessionId);
-        return;
-      }
-
-      await new Promise(r => setTimeout(r, 1500));
+    console.log(`[QR Monitor] ${accountLabel}: Starting (sessionId: ${sessionId.substring(0, 8)}...)`);
+    const pages = context.pages();
+    const page = pages[0];
+    
+    if (!page) {
+      throw new Error('No page found in context');
     }
+
+    // Strategy: Monitor for page navigation + cookie polling in parallel
+    // Weibo redirects after successful QR scan → this is our success indicator
+    let navigationDetected = false;
+    let navigationError = null;
+    
+    const navigationPromise = (async () => {
+      try {
+        console.log(`[QR Monitor] ${accountLabel}: Waiting for Weibo redirect...`);
+        // Wait for navigation to weibo.com (proves login succeeded)
+        await page.waitForNavigation({ 
+          url: /weibo\.com|sina\.com|passport\.weibo\.com/,
+          timeout: 120_000 // 2 minutes max wait
+        }).catch(e => {
+          // Navigation timeout is not fatal - fall back to polling
+          if (String(e?.message ?? '').includes('Timeout')) {
+            console.log(`[QR Monitor] ${accountLabel}: Navigation wait timeout, falling back to polling`);
+            navigationError = e;
+          }
+        });
+        navigationDetected = true;
+        console.log(`[QR Monitor] ${accountLabel}: ✅ Navigation detected (login confirmed)`);
+      } catch (err) {
+        navigationError = err;
+      }
+    })();
+
+    // Parallel: Poll for cookies (faster detection if redirect doesn't fire)
+    const pollingPromise = (async () => {
+      const pollIntervalMs = 800; // Fast polling
+      
+      while (true) {
+        const s = qrSessions.get(sessionId);
+        if (!s) return;
+        if (s.status === 'cancelled') return;
+        
+        const elapsed = Date.now() - startTime;
+        if (Date.now() > s.expiresAt) {
+          s.status = 'expired';
+          s.error = '二维码已过期，请重新获取';
+          s.completedAt = new Date().toISOString();
+          console.log(`[QR Monitor] ${accountLabel}: Session expired after ${elapsed}ms`);
+          await closeQrSessionContext(sessionId);
+          return;
+        }
+
+        pollCount++;
+        
+        try {
+          // Check multiple cookie sources
+          let allCookies = [];
+          try {
+            const domainCookies = await context.cookies([
+              'https://weibo.com',
+              'https://www.weibo.com',
+              'https://login.sina.com.cn',
+              'https://passport.weibo.com',
+              'https://login.weibo.com',
+            ]);
+            allCookies.push(...domainCookies);
+          } catch (e) {
+            // Fallback: get all cookies if domain query fails
+            try {
+              allCookies = await context.cookies();
+            } catch {}
+          }
+          
+          const cookieStr = toCookieString(allCookies);
+          const hasSub = hasCookieField(cookieStr, 'SUB');
+          const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+          
+          // Log every 15th poll or when we have partial cookies
+          if (pollCount % 15 === 1 || (hasSub !== hasXsrf)) {
+            const cnames = allCookies.map(c => c.name).slice(0, 5).join(',');
+            console.log(`[QR Monitor] ${accountLabel}: Poll #${pollCount} (${elapsed}ms): SUB=${hasSub}, XSRF=${hasXsrf}, ${allCookies.length} cookies [${cnames}...]`);
+          }
+          
+          // Success: found both required cookies
+          if (hasRequiredSessionCookies(cookieStr)) {
+            const s = qrSessions.get(sessionId);
+            if (s && s.status === 'pending') {
+              s.status = 'success';
+              s.cookie = cookieStr;
+              s.completedAt = new Date().toISOString();
+              console.log(`[QR Monitor] ${accountLabel}: ✅ Success after ${elapsed}ms (${pollCount} polls, navigation=${navigationDetected}). Cookies: ${cookieStr.length} chars`);
+              await closeQrSessionContext(sessionId);
+              return;
+            }
+          }
+        } catch (err) {
+          console.log(`[QR Monitor] ${accountLabel}: Poll error: ${err.message}`);
+        }
+        
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+      }
+    })();
+
+    // Wait for either navigation or polling to succeed
+    await Promise.race([navigationPromise, pollingPromise]);
+    
   } catch (error) {
     const s = qrSessions.get(sessionId);
     if (!s) return;
     s.status = 'failed';
     s.error = String(error?.message ?? error);
     s.completedAt = new Date().toISOString();
+    const elapsed = Date.now() - startTime;
+    console.error(`[QR Monitor] ${accountLabel}: ❌ Failed after ${elapsed}ms (${pollCount} polls): ${s.error}`);
     await closeQrSessionContext(sessionId);
   }
 }
@@ -213,6 +296,10 @@ export async function startQrLoginSession({ accountIndex, accountId = '', accoun
   // Reduced timeouts: 30s for local (usually loads in 5-15s), 60s for proxy (more unpredictable)
   const navTimeoutMs = proxyConfig ? 60_000 : 30_000;
   const edgePath = getEdgeExecutablePath();
+  
+  // Detect if running on headless environment (no DISPLAY/WAYLAND)
+  const isHeadless = !canOpenVisibleBrowser();
+  console.log(`[QR Session] account-${accountIndex + 1}: Headless mode = ${isHeadless}, platform = ${process.platform}`);
   
   // Add timeout to browser launch
   let launchTimeoutId;
@@ -259,6 +346,7 @@ export async function startQrLoginSession({ accountIndex, accountId = '', accoun
       cookie: '',
       error: null,
       completedAt: null,
+      isHeadless,
     };
 
     qrSessions.set(sessionId, session);
@@ -271,6 +359,11 @@ export async function startQrLoginSession({ accountIndex, accountId = '', accoun
       status: 'pending',
       qrDataUrl,
       expiresAt: new Date(session.expiresAt).toISOString(),
+      isHeadless,
+      ttlMs,
+      instruction: isHeadless
+        ? '服务器运行在无头模式。请用手机扫描二维码登录，系统会自动提取 Cookie。若扫码后仍未成功，可尝试使用"手动输入 Cookie"功能。'
+        : '请扫描二维码登录微博账号',
     };
   } catch (error) {
     try { await context.close(); } catch {}
