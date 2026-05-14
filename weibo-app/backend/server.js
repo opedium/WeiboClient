@@ -542,7 +542,10 @@ app.get('/api/accounts', async (req, res) => {
   try {
     const accounts = await ensureAccountIdsAndPersist();
     res.json({ ok: true, count: accounts.length, accounts: sanitizeAccountsForResponse(accounts) });
-  } catch (e) {\n    res.status(500).json({ ok: false, error: e.message });\n  }\n});
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 app.post('/api/accounts', async (req, res) => {
   try {
