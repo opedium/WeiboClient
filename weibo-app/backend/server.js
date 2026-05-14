@@ -389,8 +389,21 @@ async function validateCookieLive(cookieStr, proxy = '') {
   };
 }
 
-const refreshLocks = new Set();
+// Lock timeout (15 minutes) for DigitalOcean headless mode — prevents deadlock if process hangs
+const LOCK_TIMEOUT_MS = Number(process.env.LOCK_TIMEOUT_MS ?? 15 * 60 * 1000);
+const refreshLocks = new Map(); // { accountIndex → { startTime, reason } }
 const activeQrSessionByAccount = new Map();
+
+// Helper: check and clear expired locks
+function clearExpiredLocks() {
+  const now = Date.now();
+  for (const [idx, lockInfo] of refreshLocks.entries()) {
+    if (now - lockInfo.startTime > LOCK_TIMEOUT_MS) {
+      console.warn(`[lock-timeout] Force-clearing lock for account-${idx} after ${Math.round((now - lockInfo.startTime) / 1000)}s (reason: ${lockInfo.reason})`);
+      refreshLocks.delete(idx);
+    }
+  }
+}
 
 // helper: get account index from request (header or body)
 function accountIdx(req) {
@@ -600,16 +613,74 @@ app.post('/api/accounts/:index/reset-browser', async (req, res) => {
   }
 });
 
+// Admin endpoint: view and clear stuck locks (for emergency recovery on headless servers)
+app.post('/api/admin/locks/status', (req, res) => {
+  if (AUTH_REQUIRED && !safeTokenEqual(req.headers['x-auth-token'], AUTH_TOKEN) && !safeTokenEqual(req.cookies?.auth_token, AUTH_TOKEN)) {
+    return res.status(401).json({ ok: false, error: '未授权' });
+  }
+  clearExpiredLocks();
+  const locks = Array.from(refreshLocks.entries()).map(([idx, info]) => ({
+    accountIndex: idx,
+    lockedSince: new Date(info.startTime).toISOString(),
+    durationMs: Date.now() - info.startTime,
+    reason: info.reason,
+    expired: Date.now() - info.startTime > LOCK_TIMEOUT_MS,
+  }));
+  return res.json({
+    ok: true,
+    activeLocksCount: locks.length,
+    lockTimeoutMs: LOCK_TIMEOUT_MS,
+    locks,
+  });
+});
+
+app.post('/api/admin/locks/clear', (req, res) => {
+  if (AUTH_REQUIRED && !safeTokenEqual(req.headers['x-auth-token'], AUTH_TOKEN) && !safeTokenEqual(req.cookies?.auth_token, AUTH_TOKEN)) {
+    return res.status(401).json({ ok: false, error: '未授权' });
+  }
+  const idx = Number.parseInt(req.body?.accountIndex ?? '-1', 10);
+  if (idx === -1) {
+    // Clear all locks
+    const count = refreshLocks.size;
+    refreshLocks.clear();
+    return res.json({
+      ok: true,
+      message: `已清除所有 ${count} 个锁`,
+      clearedCount: count,
+    });
+  }
+  if (!Number.isInteger(idx) || idx < 0) {
+    return res.status(400).json({ ok: false, error: '无效账号索引' });
+  }
+  const had = refreshLocks.has(idx);
+  refreshLocks.delete(idx);
+  return res.json({
+    ok: true,
+    message: had ? `已清除账号 ${idx} 的锁` : `账号 ${idx} 无锁定`,
+    accountIndex: idx,
+    wasLocked: had,
+  });
+});
+
 app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
   const idx = Number.parseInt(req.params.index, 10);
   if (!Number.isInteger(idx) || idx < 0) {
     return res.status(400).json({ ok: false, error: '无效账号索引' });
   }
+
+  clearExpiredLocks();
   if (refreshLocks.has(idx)) {
-    return res.status(409).json({ ok: false, error: '该账号正在刷新 Cookie，请稍候重试' });
+    const lockInfo = refreshLocks.get(idx);
+    const durationSec = Math.round((Date.now() - lockInfo.startTime) / 1000);
+    return res.status(409).json({
+      ok: false,
+      error: `该账号正在刷新 Cookie，请稍候重试（已锁定 ${durationSec}s）`,
+      lockedSince: new Date(lockInfo.startTime).toISOString(),
+      reason: lockInfo.reason,
+    });
   }
 
-  refreshLocks.add(idx);
+  refreshLocks.set(idx, { startTime: Date.now(), reason: 'manual_refresh' });
   try {
     const accounts = await getAccounts();
     if (idx >= accounts.length) {
@@ -698,6 +769,8 @@ app.post('/api/accounts/:index/qr-login/start', async (req, res) => {
   if (!Number.isInteger(idx) || idx < 0) {
     return res.status(400).json({ ok: false, error: '无效账号索引' });
   }
+
+  clearExpiredLocks();
   if (refreshLocks.has(idx)) {
     const existingSessionId = activeQrSessionByAccount.get(idx);
     if (existingSessionId) {
@@ -712,10 +785,12 @@ app.post('/api/accounts/:index/qr-login/start', async (req, res) => {
         });
       }
     }
-    return res.status(409).json({ ok: false, error: '该账号正在刷新 Cookie，请稍候重试' });
+    const lockInfo = refreshLocks.get(idx);
+    const durationSec = Math.round((Date.now() - lockInfo.startTime) / 1000);
+    return res.status(409).json({ ok: false, error: `该账号正在刷新 Cookie，请稍候重试（已锁定 ${durationSec}s）` });
   }
 
-  refreshLocks.add(idx);
+  refreshLocks.set(idx, { startTime: Date.now(), reason: 'qr_login' });
   try {
     const accounts = await getAccounts();
     if (idx >= accounts.length) {
