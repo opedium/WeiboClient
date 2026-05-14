@@ -6,7 +6,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import axios from 'axios';
-import { timingSafeEqual } from 'crypto';
+import { timingSafeEqual, randomUUID } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -122,6 +122,7 @@ function compactCookieValue(cookie, uid = '') {
 
 function sanitizeAccountsForResponse(accounts) {
   return (accounts ?? []).map(a => ({
+    accountId: String(a.accountId ?? '').trim(),
     name: String(a.name ?? '').trim(),
     uid: String(a.uid ?? '').trim(),
     hasCookie: !!String(a.cookie ?? '').trim(),
@@ -517,21 +518,37 @@ function wrap(fn) {
   };
 }
 
+// Helper: ensure all accounts have stable accountIds
+async function ensureAccountIdsAndPersist() {
+  const accounts = await getAccounts();
+  let modified = false;
+  const updated = accounts.map((a, i) => {
+    if (!a.accountId || !String(a.accountId).trim()) {
+      console.log(`[startup] Migrating account ${i + 1} without accountId, assigning new UUID`);
+      modified = true;
+      return { ...a, accountId: randomUUID() };
+    }
+    return a;
+  });
+  if (modified) {
+    await setAccounts(updated);
+    console.log(`[startup] Persisted ${updated.length} accounts with stable IDs`);
+  }
+  return updated;
+}
+
 // ── accounts ──────────────────────────────────────────────
 app.get('/api/accounts', async (req, res) => {
   try {
-    const accounts = await getAccounts();
+    const accounts = await ensureAccountIdsAndPersist();
     res.json({ ok: true, count: accounts.length, accounts: sanitizeAccountsForResponse(accounts) });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+  } catch (e) {\n    res.status(500).json({ ok: false, error: e.message });\n  }\n});
 
 app.post('/api/accounts', async (req, res) => {
   try {
     const { accounts } = req.body;  // [{cookie, name, proxy}]
     if (!Array.isArray(accounts)) return res.status(400).json({ ok: false, error: 'accounts must be array' });
-    const existing = await getAccounts();
+    const existing = await ensureAccountIdsAndPersist();
     const clean = (await Promise.all(accounts.map(async (a, i) => {
         const name = String(a.name ?? '').trim();
         const incomingCookie = String(a.cookie ?? '').trim();
@@ -539,6 +556,8 @@ app.post('/api/accounts', async (req, res) => {
         const cookie = incomingCookie || (keepExisting ? String(existing[i]?.cookie ?? '').trim() : '');
         const proxy = String(a.proxy ?? '').trim();
         let uid = keepExisting && !incomingCookie ? String(existing[i]?.uid ?? '').trim() : '';
+        // Generate stable accountId: use existing if available, otherwise create new UUID
+        const accountId = String(a.accountId ?? existing[i]?.accountId ?? randomUUID()).trim();
 
         if (incomingCookie) {
           try {
@@ -549,7 +568,7 @@ app.post('/api/accounts', async (req, res) => {
           } catch {}
         }
 
-        return { cookie, name: name || `账号 ${i + 1}`, proxy, uid };
+        return { accountId, cookie, name: name || `账号 ${i + 1}`, proxy, uid };
       }))).filter(a => a.cookie);
     await setAccounts(clean);
     res.json({ ok: true, count: clean.length, accounts: sanitizeAccountsForResponse(clean) });
