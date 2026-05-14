@@ -148,10 +148,11 @@ function saveAccountsFile(accounts) {
 export async function getAccounts() {
   if (!isDBConfigured()) return loadAccountsFile();
   const docs = await (await col(ACCOUNTS_COL))
-    .find({}, { projection: { _id: 0, index: 1, name: 1, cookie: 1, proxy: 1, uid: 1, cookieCompact: 1 } })
+    .find({}, { projection: { _id: 1, index: 1, name: 1, cookie: 1, proxy: 1, uid: 1, cookieCompact: 1, accountId: 1 } })
     .sort({ index: 1 })
     .toArray();
   return docs.map(d => ({
+    accountId: d.accountId || d._id?.toString() || `account-${Date.now()}`,
     name: d.name,
     cookie: decrypt(d.cookie),
     uid: d.uid ? String(d.uid) : '',
@@ -160,22 +161,53 @@ export async function getAccounts() {
   }));
 }
 
-/** Replaces all accounts with the given [{ cookie, name, proxy }] list */
+/** Replaces all accounts with the given [{ cookie, name, proxy, accountId }] list */
 export async function setAccounts(accounts) {
   if (!isDBConfigured()) { saveAccountsFile(accounts); return; }
   const c = await col(ACCOUNTS_COL);
+  
+  // Preserve accountIds and generate for new accounts
+  const { v4: uuidv4 } = await import('uuid');
+  const accountsWithIds = accounts.map((a, i) => ({
+    index: i,
+    accountId: a.accountId || uuidv4(),
+    name: a.name,
+    cookie: encrypt(a.cookie),
+    uid: a.uid ? String(a.uid) : '',
+    cookieCompact: compactCookie(a.cookie, a.uid),
+    proxy: a.proxy ? encrypt(a.proxy) : '',
+  }));
+  
+  // Delete and insert (preserves IDs since we're providing them)
   await c.deleteMany({});
-  if (accounts.length > 0) {
-    await c.insertMany(
-      accounts.map((a, i) => ({
-        index: i,
-        name: a.name,
-        cookie: encrypt(a.cookie),
-        uid: a.uid ? String(a.uid) : '',
-        cookieCompact: compactCookie(a.cookie, a.uid),
-        proxy: a.proxy ? encrypt(a.proxy) : '',
-      }))
-    );
+  if (accountsWithIds.length > 0) {
+    await c.insertMany(accountsWithIds);
+  }
+}
+
+// ── Account ID Migration ─────────────────────────────────────────────────────
+// Ensure all existing accounts have unique accountIds (fixes data collision on delete)
+export async function migrateAccountIds() {
+  if (!isDBConfigured()) return;
+  try {
+    const { v4: uuidv4 } = await import('uuid');
+    const c = await col(ACCOUNTS_COL);
+    
+    // Find accounts without accountId
+    const accountsWithoutId = await c.find({ accountId: { $exists: false } }).toArray();
+    
+    if (accountsWithoutId.length > 0) {
+      console.log(`[migration] Generating accountIds for ${accountsWithoutId.length} accounts...`);
+      for (const account of accountsWithoutId) {
+        await c.updateOne(
+          { _id: account._id },
+          { $set: { accountId: uuidv4() } }
+        );
+      }
+      console.log(`✅ Account ID migration complete: ${accountsWithoutId.length} accounts updated`);
+    }
+  } catch (err) {
+    console.warn(`⚠️  Account ID migration failed: ${err.message}`);
   }
 }
 

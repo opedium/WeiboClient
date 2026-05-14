@@ -204,9 +204,9 @@ async function monitorQrSession(sessionId) {
   }
 }
 
-export async function startQrLoginSession({ accountIndex, accountName = '', proxy = '', maxWaitMs = QR_LOGIN_TTL_MS }) {
+export async function startQrLoginSession({ accountIndex, accountId = '', accountName = '', proxy = '', maxWaitMs = QR_LOGIN_TTL_MS }) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
-  const userDataDir = profileDirForAccount(accountIndex, accountName);
+  const userDataDir = profileDirForAccount(accountId || `idx-${accountIndex}`);
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const proxyConfig = parsePlaywrightProxy(proxy);
@@ -342,10 +342,10 @@ function slugify(v) {
     .slice(0, 48);
 }
 
-function profileDirForAccount(accountIndex, accountName) {
-  // Use index-only naming (robust to name changes)
-  // Old format: account-1-name -> New format: account-1
-  const key = `account-${accountIndex + 1}`;
+function profileDirForAccount(accountId) {
+  // Use unique accountId (robust to account deletion, prevents data collision)
+  // Each account gets a stable directory regardless of its position in the list
+  const key = `account-${accountId}`;
   return path.join(AUTH_DIR, key);
 }
 
@@ -526,6 +526,67 @@ async function migrateProfileDirectories() {
 
 // Run migration on module load
 migrateProfileDirectories().catch(err => console.error('Migration error:', err));
+
+// ── Profile Directory UUID Migration ────────────────────────────────────────
+// Migrate from index-based (account-1, account-2) to UUID-based (account-{uuid})
+async function migrateProfileDirectoriesToUuid(accounts) {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  
+  try {
+    const entries = fs.readdirSync(AUTH_DIR, { withFileTypes: true });
+    let migratedCount = 0;
+    
+    // Build a map of index → accountId from accounts
+    const indexToId = new Map(
+      accounts.map((a, i) => [i + 1, a.accountId || `idx-${i}`])
+    );
+    
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const dirName = entry.name;
+      
+      // Match index-based format: account-N (where N is 1-based index)
+      const match = dirName.match(/^account-(\d+)$/);
+      if (!match) continue;
+      
+      const accountIndex = parseInt(match[1], 10);
+      const accountId = indexToId.get(accountIndex);
+      
+      if (!accountId) {
+        console.log(`  [uuid migration] account-${accountIndex}: no matching account, skipping`);
+        continue;
+      }
+      
+      const newDirName = `account-${accountId}`;
+      
+      // Skip if already in new format
+      if (dirName === newDirName) continue;
+      
+      const oldPath = path.join(AUTH_DIR, dirName);
+      const newPath = path.join(AUTH_DIR, newDirName);
+      
+      if (fs.existsSync(newPath)) {
+        // UUID format exists, remove old index-based one
+        fs.rmSync(oldPath, { recursive: true, force: true });
+        console.log(`  [uuid migration] removed old account-${accountIndex} (uuid version exists)`);
+        migratedCount++;
+      } else {
+        // Rename index-based to UUID-based
+        fs.renameSync(oldPath, newPath);
+        console.log(`  [uuid migration] renamed account-${accountIndex} → account-${accountId.substring(0, 8)}...`);
+        migratedCount++;
+      }
+    }
+    
+    if (migratedCount > 0) {
+      console.log(`✅ Profile UUID migration: ${migratedCount} directories updated to UUID format`);
+    }
+  } catch (err) {
+    console.warn(`⚠️  Profile UUID migration failed: ${err.message}`);
+  }
+}
+
+export { migrateProfileDirectoriesToUuid };
 
 /**
  * Headless refresh: reuses the existing persistent profile so no manual login is needed.
@@ -928,13 +989,13 @@ export async function keepAliveAllAccounts(accounts) {
   const DELAY_BETWEEN_REFRESHES_MS = 2000; // 2s between account refreshes
   
   for (let i = 0; i < accounts.length; i++) {
-    const { name = '', cookie = '', proxy = '' } = accounts[i];
-    const userDataDir = profileDirForAccount(i, name);
+    const { accountId = '', name = '', cookie = '', proxy = '' } = accounts[i];
+    const userDataDir = profileDirForAccount(accountId || `idx-${i}`);
     const acctLabel = `账号 ${i + 1}(${name})`;
     
     if (!profileHasSession(userDataDir)) {
       console.log(`  ⚠️  ${acctLabel}: no_profile (${userDataDir})`);
-      results.push({ accountIndex: i, accountName: name, ok: false, error: 'no_profile' });
+      results.push({ accountIndex: i, accountId, accountName: name, ok: false, error: 'no_profile' });
       // Small delay even for no_profile to avoid hammering system
       if (i < accounts.length - 1) {
         await new Promise(r => setTimeout(r, 500));
@@ -948,7 +1009,7 @@ export async function keepAliveAllAccounts(accounts) {
       const validation = await validateCookieBasic(cookie);
       if (!validation.valid) {
         console.log(`  ❌ ${acctLabel}: cookie invalid (${validation.reason}) — skipping refresh`);
-        results.push({ accountIndex: i, accountName: name, ok: false, error: `COOKIE_INVALID: ${validation.reason}` });
+        results.push({ accountIndex: i, accountId, accountName: name, ok: false, error: `COOKIE_INVALID: ${validation.reason}` });
         if (i < accounts.length - 1) {
           await new Promise(r => setTimeout(r, 500));
         }
@@ -969,15 +1030,15 @@ export async function keepAliveAllAccounts(accounts) {
       const cookieValidation = await validateCookieBasic(refreshed.cookie);
       if (!cookieValidation.valid) {
         console.log(`  ⚠️  ${acctLabel}: extracted cookie invalid (${cookieValidation.reason})`);
-        results.push({ accountIndex: i, accountName: name, ok: false, error: `EXTRACTED_COOKIE_INVALID: ${cookieValidation.reason}` });
+        results.push({ accountIndex: i, accountId, accountName: name, ok: false, error: `EXTRACTED_COOKIE_INVALID: ${cookieValidation.reason}` });
       } else {
         console.log(`  ✅ ${acctLabel}: success (cookie updated, health: ${cookieValidation.health})`);
-        results.push({ accountIndex: i, accountName: name, ok: true, cookie: refreshed.cookie });
+        results.push({ accountIndex: i, accountId, accountName: name, ok: true, cookie: refreshed.cookie });
       }
     } catch (e) {
       const error = isNavigationTimeoutError(e) ? 'NETWORK_TIMEOUT' : e.message;
       console.log(`  ❌ ${acctLabel}: ${error}`);
-      results.push({ accountIndex: i, accountName: name, ok: false, error });
+      results.push({ accountIndex: i, accountId, accountName: name, ok: false, error });
     }
     
     // Delay between refreshes to let memory be reclaimed

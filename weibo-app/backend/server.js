@@ -23,10 +23,11 @@ import {
   getCaptchaStatus,
   cancelCaptchaSession,
   openAccountInBrowser,
+  migrateProfileDirectoriesToUuid,
 } from './cookieRefresh.js';
 import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule, saveKeepAliveLog, getKeepAliveLogs, getLatestKeepAliveLog,
-         saveKeepAliveConfig, getKeepAliveConfig, deleteOldKeepAliveLogs } from './db.js';
+         saveKeepAliveConfig, getKeepAliveConfig, deleteOldKeepAliveLogs, migrateAccountIds } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3001);
@@ -1927,8 +1928,8 @@ async function startCookieKeepAlive() {
         }
       }
       
-      const updated = accounts.map((a, i) => {
-        const r = validatedResults.find(x => x.accountIndex === i);
+      const updated = accounts.map((a) => {
+        const r = validatedResults.find(x => x.accountId === a.accountId);
         return r?.ok && r.cookie ? { ...a, cookie: r.cookie } : a;
       });
       await setAccounts(updated);
@@ -2019,6 +2020,16 @@ async function start() {
 
   const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`✅ Weibo backend listening on http://0.0.0.0:${PORT}`);
+    
+    // Migrate existing accounts to have unique IDs
+    try {
+      await migrateAccountIds();
+      const accounts = await getAccounts();
+      await migrateProfileDirectoriesToUuid(accounts);
+    } catch (err) {
+      console.error(`❌ Account/profile migration failed: ${err.message}`);
+    }
+    
     startScheduler();
     try {
       await startCookieKeepAlive();
