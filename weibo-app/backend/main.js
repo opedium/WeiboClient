@@ -1,7 +1,13 @@
 // src/main.js — Appwrite Function entry point
 // Auth: credentials verified against Appwrite (server-side, no CORS restriction).
 // Sessions: stateless HMAC tokens (8 h) — no external call per request.
+
+// Disable SSL verification at Node.js process level
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
+import https from 'https';
+import axios from 'axios';
 import { createClient, bidToMid } from './weibo.js';
 import {
   getCopywritingGroups, setCopywritingGroups,
@@ -12,6 +18,10 @@ const APPWRITE_ENDPOINT  = process.env.APPWRITE_ENDPOINT   ?? 'https://sgp.cloud
 const APPWRITE_PROJECT   = process.env.APPWRITE_PROJECT_ID ?? '69f221090023490a8740';
 const SECRET             = process.env.COOKIE_SECRET ?? randomBytes(32).toString('hex');
 const TOKEN_TTL          = 8 * 60 * 60 * 1000; // 8 hours
+
+// Allow self-signed certificates
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+const axiosClient = axios.create({ httpsAgent, validateStatus: () => true });
 
 // ── HMAC session token ───────────────────────────────────────────────────────
 function issueToken() {
@@ -247,6 +257,17 @@ export default async ({ req, res, log, error }) => {
         return res.json({ ok: true, count: clean.length, accounts: sanitizeAccountsForResponse(clean) });
       } catch (e) { return res.json({ ok: false, error: e.message }, 500); }
     }
+    if (method === 'DELETE') {
+      try {
+        const { index } = getBody(req);
+        if (index === undefined || index === null) return res.json({ ok: false, error: 'index is required' }, 400);
+        const accounts = await getAccounts();
+        if (index < 0 || index >= accounts.length) return res.json({ ok: false, error: 'invalid account index' }, 400);
+        const filtered = accounts.filter((_, i) => i !== index);
+        await setAccounts(filtered);
+        return res.json({ ok: true, count: filtered.length, message: `Account at index ${index} deleted` });
+      } catch (e) { return res.json({ ok: false, error: e.message }, 500); }
+    }
   }
 
   // ── Cookie validator ──────────────────────────────────────────────────
@@ -267,9 +288,8 @@ export default async ({ req, res, log, error }) => {
       Accept: 'application/json, text/plain, */*',
     };
     const tryFetch = async (url) => {
-      const resp = await fetch(url, { headers: weiboHeaders });
-      const text = await resp.text();
-      try { return JSON.parse(text); } catch { return null; }
+      const resp = await axiosClient.get(url, { headers: weiboHeaders });
+      try { return resp.data && typeof resp.data === 'object' ? resp.data : JSON.parse(resp.data); } catch { return null; }
     };
     try {
       let data = await tryFetch('https://weibo.com/ajax/statuses/mymblog?page=1&feature=0');

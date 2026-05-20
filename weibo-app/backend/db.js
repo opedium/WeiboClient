@@ -43,6 +43,14 @@ export async function connectDB() {
   return db;
 }
 
+export async function closeDB() {
+  if (client) {
+    await client.close();
+    client = undefined;
+    db = undefined;
+  }
+}
+
 async function col(name) {
   await connectDB();
   return db.collection(name);
@@ -165,10 +173,20 @@ export async function getAccounts() {
 export async function setAccounts(accounts) {
   if (!isDBConfigured()) { saveAccountsFile(accounts); return; }
   const c = await col(ACCOUNTS_COL);
-  
+
+  // Deduplicate by accountId (keep first occurrence) to guard against double-saves
+  const seen = new Set();
+  const deduped = accounts.filter(a => {
+    const key = String(a.accountId ?? '').trim();
+    if (!key) return true; // no ID yet — keep
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
   // Preserve accountIds and generate for new accounts
   const { v4: uuidv4 } = await import('uuid');
-  const accountsWithIds = accounts.map((a, i) => ({
+  const accountsWithIds = deduped.map((a, i) => ({
     index: i,
     accountId: a.accountId || uuidv4(),
     name: a.name,

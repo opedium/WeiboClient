@@ -12,6 +12,23 @@ function getToken() { return localStorage.getItem('auth_token') || ''; }
 function setToken(token) { localStorage.setItem('auth_token', token); }
 function clearToken() { localStorage.removeItem('auth_token'); }
 
+// Detect and intercept network security blocks (Cato, Palo Alto, etc.)
+async function isNetworkBlock(response) {
+  if (!response.ok) return false;
+  const contentType = response.headers.get('content-type') || '';
+  // If we got HTML instead of JSON, it's likely a network block page
+  return contentType.includes('text/html');
+}
+
+// Wrapper to intercept network blocks from fetch responses
+async function safeFetch(url, options = {}) {
+  const res = await fetch(url, options);
+  if (await isNetworkBlock(res)) {
+    throw new Error('🚫 网络被限制: 您的网络安全政策阻止了对该服务的访问。请尝试：\n1. 使用 VPN\n2. 配置代理\n3. 更换网络\n4. 联系网络管理员白名单该服务');
+  }
+  return res;
+}
+
 function AuthGate({ children }) {
   const [booting, setBooting] = useState(true);
   const [authRequired, setAuthRequired] = useState(true);
@@ -25,7 +42,7 @@ function AuthGate({ children }) {
 
     (async () => {
       try {
-        const healthRes = await fetch(`${API}/api/health`);
+        const healthRes = await safeFetch(`${API}/api/health`);
         const health = await healthRes.json().catch(() => ({}));
         const required = health?.authRequired !== false;
         if (cancelled) return;
@@ -42,7 +59,7 @@ function AuthGate({ children }) {
           return;
         }
 
-        const meRes = await fetch(`${API}/api/me`, {
+        const meRes = await safeFetch(`${API}/api/me`, {
           headers: { 'x-auth-token': token },
         });
         const me = await meRes.json().catch(() => ({}));
@@ -75,7 +92,7 @@ function AuthGate({ children }) {
     setSubmitting(true);
     setError('');
     try {
-      const res = await fetch(`${API}/api/login`, {
+      const res = await safeFetch(`${API}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: input }),
@@ -463,7 +480,7 @@ async function callApi(op, formData, account) {
         if (v instanceof File) body.append(k, v);
         else if (v) body.append(k, v);
       }
-      const res = await fetch(`${API}${op.endpoint}`, { method: 'POST', headers, body, signal: controller.signal });
+      const res = await safeFetch(`${API}${op.endpoint}`, { method: 'POST', headers, body, signal: controller.signal });
       return res.json();
     }
 
@@ -473,13 +490,13 @@ async function callApi(op, formData, account) {
         if (v) params.set(k, v);
       }
       const url = `${API}${op.endpoint}${params.toString() ? '?' + params : ''}`;
-      const res = await fetch(url, { headers, signal: controller.signal });
+      const res = await safeFetch(url, { headers, signal: controller.signal });
       return res.json();
     }
 
     // POST JSON
     headers['Content-Type'] = 'application/json';
-    const res = await fetch(`${API}${op.endpoint}`, {
+    const res = await safeFetch(`${API}${op.endpoint}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(formData),
@@ -516,11 +533,12 @@ function AccountsPanel({ onCountChange }) {
   const qrPollRef = useRef(null);
 
   useEffect(() => {
-    fetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
+    safeFetch(`${API}/api/accounts`, { headers: { 'x-auth-token': getToken() } }).then(r => r.json()).then(d => {
       console.log('[App] Accounts response:', d);
       if (d.ok) {
         console.log('[App] Setting accounts, count:', (d.accounts ?? []).length);
         setAccounts((d.accounts ?? []).map(a => ({
+          accountId: a.accountId ?? '',
           name: a.name ?? '',
           cookie: '',
           hasCookie: !!a.hasCookie,
@@ -558,9 +576,25 @@ function AccountsPanel({ onCountChange }) {
   const addAccount = () =>
     setAccounts(a => [...a, { cookie: '', name: `账号 ${a.length + 1}`, hasCookie: false, cookieMasked: '', proxy: '' }]);
 
-  const removeAccount = (i) => {
-    setAccounts(a => a.filter((_, idx) => idx !== i));
-    setValidResults(v => { const n = { ...v }; delete n[i]; return n; });
+  const removeAccount = async (i) => {
+    try {
+      const res = await safeFetch(`${API}/api/accounts`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
+        body: JSON.stringify({ index: i }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setAccounts(a => a.filter((_, idx) => idx !== i));
+        setValidResults(v => { const n = { ...v }; delete n[i]; return n; });
+      } else {
+        console.error('Delete failed:', data.error);
+        alert(`删除失败: ${data.error}`);
+      }
+    } catch (err) {
+      console.error('Delete error:', err);
+      alert(`删除出错: ${err.message}`);
+    }
   };
 
   const validate = async (i) => {
@@ -569,7 +603,7 @@ function AccountsPanel({ onCountChange }) {
     const proxy = String(accounts[i]?.proxy ?? '').trim();
     setValidating(v => ({ ...v, [i]: true }));
     try {
-      const res = await fetch(`${API}/api/validate-cookie`, {
+      const res = await safeFetch(`${API}/api/validate-cookie`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ cookie, proxy }),
@@ -595,11 +629,12 @@ function AccountsPanel({ onCountChange }) {
   const save = async () => {
     setSaveError(null);
     try {
-      const res = await fetch(`${API}/api/accounts`, {
+      const res = await safeFetch(`${API}/api/accounts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({
           accounts: accounts.map(a => ({
+            accountId: a.accountId ?? '',
             name: a.name,
             cookie: a.cookie,
             keepExisting: !!a.hasCookie && !String(a.cookie ?? '').trim(),
@@ -611,6 +646,7 @@ function AccountsPanel({ onCountChange }) {
       if (!data.ok) throw new Error(data.error ?? '保存失败');
       if (Array.isArray(data.accounts)) {
         setAccounts(data.accounts.map(a => ({
+          accountId: a.accountId ?? '',
           name: a.name ?? '',
           cookie: '',
           hasCookie: !!a.hasCookie,
@@ -631,7 +667,7 @@ function AccountsPanel({ onCountChange }) {
     setResetting(v => ({ ...v, [i]: true }));
     setSaveError(null);
     try {
-      const res = await fetch(`${API}/api/accounts/${i}/reset-browser`, {
+      const res = await safeFetch(`${API}/api/accounts/${i}/reset-browser`, {
         method: 'POST',
         headers: { 'x-auth-token': getToken() },
       });
@@ -655,7 +691,7 @@ function AccountsPanel({ onCountChange }) {
     setOpeningBrowser(v => ({ ...v, [i]: true }));
     setSaveError(null);
     try {
-      const res = await fetch(`${API}/api/accounts/${i}/open-in-browser`, {
+      const res = await safeFetch(`${API}/api/accounts/${i}/open-in-browser`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({}),
@@ -683,7 +719,7 @@ function AccountsPanel({ onCountChange }) {
   };
 
   const startQrRefreshFlow = async (i) => {
-    const res = await fetch(`${API}/api/accounts/${i}/qr-login/start`, {
+    const res = await safeFetch(`${API}/api/accounts/${i}/qr-login/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
       body: JSON.stringify({ maxWaitMs: 180000 }),
@@ -715,7 +751,7 @@ function AccountsPanel({ onCountChange }) {
 
     const poll = async () => {
       try {
-        const sres = await fetch(`${API}/api/accounts/${i}/qr-login/status?sessionId=${encodeURIComponent(sessionId)}`, {
+        const sres = await safeFetch(`${API}/api/accounts/${i}/qr-login/status?sessionId=${encodeURIComponent(sessionId)}`, {
           headers: { 'x-auth-token': getToken() },
         });
         const stext = await sres.text();
@@ -788,7 +824,7 @@ function AccountsPanel({ onCountChange }) {
     setRefreshing(v => ({ ...v, [i]: true }));
     try {
       // Try silent refresh first. This avoids QR scan when server-side session is still alive.
-      const res = await fetch(`${API}/api/accounts/${i}/refresh-cookie`, {
+      const res = await safeFetch(`${API}/api/accounts/${i}/refresh-cookie`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ maxWaitMs: 120000 }),
@@ -836,7 +872,7 @@ function AccountsPanel({ onCountChange }) {
   const cancelQrLogin = async (i) => {
     const sessionId = String(qrLogin?.sessionId ?? '').trim();
     try {
-      await fetch(`${API}/api/accounts/${i}/qr-login/cancel`, {
+      await safeFetch(`${API}/api/accounts/${i}/qr-login/cancel`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ sessionId }),
@@ -929,7 +965,13 @@ function AccountsPanel({ onCountChange }) {
             {qrLogin?.index === i && qrLogin?.sessionId && (
               <div className="cookie-status" style={{ display: 'block' }}>
                 <div style={{ fontWeight: 600, marginBottom: 8 }}>扫码登录刷新 Cookie</div>
-                {qrLogin.qrDataUrl ? (
+                {qrLogin.status === 'success' ? (
+                  <div style={{ textAlign: 'center', paddingTop: 20, paddingBottom: 20 }}>
+                    <div style={{ fontSize: 48, marginBottom: 12 }}>✓</div>
+                    <div style={{ color: '#a6e3a1', fontSize: 16, fontWeight: 600, marginBottom: 8 }}>登录成功!</div>
+                    <div style={{ opacity: 0.8, marginBottom: 8 }}>Cookie 已更新并验证</div>
+                  </div>
+                ) : qrLogin.qrDataUrl ? (
                   <img
                     src={qrLogin.qrDataUrl}
                     alt="微博登录二维码"
@@ -938,15 +980,19 @@ function AccountsPanel({ onCountChange }) {
                 ) : (
                   <div>二维码加载中...</div>
                 )}
-                <div style={{ marginTop: 8, opacity: 0.9 }}>
-                  状态：{qrLogin.status === 'pending' ? '等待扫码/确认' : qrLogin.status}
-                  {qrLogin.expiresAt ? ` · 过期时间 ${new Date(qrLogin.expiresAt).toLocaleTimeString()}` : ''}
-                </div>
-                {qrLogin.error && <div style={{ marginTop: 6, color: '#ffb4b4' }}>{qrLogin.error}</div>}
-                {qrLogin.status === 'pending' && (
-                  <div style={{ marginTop: 10 }}>
-                    <button className="btn-secondary" onClick={() => cancelQrLogin(i)}>取消扫码</button>
-                  </div>
+                {qrLogin.status !== 'success' && (
+                  <>
+                    <div style={{ marginTop: 8, opacity: 0.9 }}>
+                      状态：{qrLogin.status === 'pending' ? '等待扫码/确认' : qrLogin.status}
+                      {qrLogin.expiresAt ? ` · 过期时间 ${new Date(qrLogin.expiresAt).toLocaleTimeString()}` : ''}
+                    </div>
+                    {qrLogin.error && <div style={{ marginTop: 6, color: '#ffb4b4' }}>{qrLogin.error}</div>}
+                    {qrLogin.status === 'pending' && (
+                      <div style={{ marginTop: 10 }}>
+                        <button className="btn-secondary" onClick={() => cancelQrLogin(i)}>取消扫码</button>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -1009,7 +1055,7 @@ function CopywritingPanel() {
 
   const save = async () => {
     try {
-      const res = await fetch(`${API}/api/copywriting`, {
+      const res = await safeFetch(`${API}/api/copywriting`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
         body: JSON.stringify({ groups }),
@@ -1212,7 +1258,7 @@ function SchedulesPanel({ accountNames }) {
     const id = job.id || job._dbId;
     if (!id) { alert('任务缺少 ID，无法删除，请刷新页面后重试'); return; }
     try {
-      const r = await fetch(`${API}/api/schedules/${id}`, { method: 'DELETE', headers: { 'x-auth-token': getToken() } });
+      const r = await safeFetch(`${API}/api/schedules/${id}`, { method: 'DELETE', headers: { 'x-auth-token': getToken() } });
       const d = await r.json();
       if (!d.ok) alert(d.error ?? '删除失败');
     } catch { alert('网络错误，删除失败'); }
@@ -1220,7 +1266,7 @@ function SchedulesPanel({ accountNames }) {
   };
 
   const runNow = async (id) => {
-    const r = await fetch(`${API}/api/schedules/${id}/run`, { method: 'POST', headers: { 'x-auth-token': getToken() } });
+    const r = await safeFetch(`${API}/api/schedules/${id}/run`, { method: 'POST', headers: { 'x-auth-token': getToken() } });
     const d = await r.json();
     if (!d.ok) alert(d.error ?? '执行失败');
     else { alert('已触发执行'); load(); }
@@ -1290,13 +1336,13 @@ function SchedulesPanel({ accountNames }) {
       
       let r;
       if (editingJobId) {
-        r = await fetch(`${API}/api/schedules/${editingJobId}`, {
+        r = await safeFetch(`${API}/api/schedules/${editingJobId}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify(body),
         });
       } else {
-        r = await fetch(`${API}/api/schedules`, {
+        r = await safeFetch(`${API}/api/schedules`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify(body),
@@ -1517,7 +1563,7 @@ function InboxPanel({ account }) {
       if (since) params.set('sinceId', since);
       if (tabId === 'dms' && since) params.set('page', since);
       const url = `${API}${tabDef.endpoint}${params.toString() ? '?' + params : ''}`;
-      const res = await fetch(url, { headers: headers() });
+      const res = await safeFetch(url, { headers: headers() });
       const d = await res.json();
       if (!d.ok) throw new Error(d.error ?? '请求失败');
       setTabData(v => ({ ...v, [tabId]: d.data ?? d }));
@@ -1543,7 +1589,7 @@ function InboxPanel({ account }) {
     setDmContent('');
     setDmChatLoading(true);
     try {
-      const res = await fetch(`${API}/api/inbox/dm-chat?uid=${encodeURIComponent(uid)}`, { headers: headers() });
+      const res = await safeFetch(`${API}/api/inbox/dm-chat?uid=${encodeURIComponent(uid)}`, { headers: headers() });
       const d = await res.json();
       if (!d.ok) throw new Error(d.error ?? '加载失败');
       setDmChat(d.data ?? d);
@@ -1559,7 +1605,7 @@ function InboxPanel({ account }) {
     setDmSending(true);
     setDmSendResult(null);
     try {
-      const res = await fetch(`${API}/api/inbox/dm-send`, {
+      const res = await safeFetch(`${API}/api/inbox/dm-send`, {
         method: 'POST',
         headers: { ...headers(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ uid: openDmUid, content: dmContent.trim() }),
@@ -1901,7 +1947,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
       if (op.isBatch) {
         // Self-contained batch endpoint (e.g. /api/batch-like-comment-stream):
         // handles multi-account logic internally — call it directly.
-        const res = await fetch(`${API}${op.endpoint}`, {
+        const res = await safeFetch(`${API}${op.endpoint}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify({
@@ -1953,7 +1999,7 @@ function OperationForm({ op, account, accountCount, accountNames }) {
           }
         }
       } else if (batchMode) {
-        const res = await fetch(`${API}/api/batch-stream`, {
+        const res = await safeFetch(`${API}/api/batch-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-auth-token': getToken() },
           body: JSON.stringify({
@@ -2296,7 +2342,7 @@ function KeepAliveLogsPanel() {
     setIsTriggering(true);
     setError('');
     try {
-      const res = await fetch(`${API}/api/keep-alive/run`, {
+      const res = await safeFetch(`${API}/api/keep-alive/run`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'x-auth-token': getToken() },
@@ -2393,7 +2439,7 @@ function KeepAliveLogsPanel() {
     setConfigSubmitting(true);
     setConfigError('');
     try {
-      const res = await fetch(`${API}/api/keep-alive-config`, {
+      const res = await safeFetch(`${API}/api/keep-alive-config`, {
         method: 'POST',
         credentials: 'include',
         headers: {

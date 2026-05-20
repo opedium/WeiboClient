@@ -2,10 +2,15 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Disable SSL verification at Node.js process level (for self-signed certificates)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import axios from 'axios';
+import https from 'https';
+import http from 'http';
 import { timingSafeEqual, randomUUID } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -25,7 +30,7 @@ import {
   openAccountInBrowser,
   migrateProfileDirectoriesToUuid,
 } from './cookieRefresh.js';
-import { connectDB, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
+import { connectDB, closeDB, isDBConfigured, getCopywritingGroups, setCopywritingGroups, getAccounts, setAccounts,
          getSchedules, addSchedule, updateSchedule, deleteSchedule, saveKeepAliveLog, getKeepAliveLogs, getLatestKeepAliveLog,
          saveKeepAliveConfig, getKeepAliveConfig, deleteOldKeepAliveLogs, migrateAccountIds } from './db.js';
 
@@ -44,6 +49,14 @@ const AUTH_REQUIRED = String(process.env.AUTH_REQUIRED ?? (AUTH_TOKEN ? 'true' :
 const PUBLIC_ROUTES = new Set(['/api/login', '/api/logout', '/api/me', '/api/health']);
 const MONGODB_URI = String(process.env.MONGODB_URI ?? '').trim();
 const COOKIE_SECRET = String(process.env.COOKIE_SECRET ?? '').trim();
+
+// Allow self-signed certificates for HTTPS requests
+const defaultHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+const defaultHttpAgent = new http.Agent();
+
+// Configure default axios instance with agents
+axios.defaults.httpsAgent = defaultHttpsAgent;
+axios.defaults.httpAgent = defaultHttpAgent;
 
 // Track server startup time for crash detection
 let SERVER_STARTUP_TIME = null;
@@ -142,7 +155,7 @@ function cookieFieldValue(cookieStr, key) {
 }
 
 function checkCookieFields(cookieStr) {
-  const required = ['SUB', 'XSRF-TOKEN'];
+  const required = ['SUB', 'X-CSRF-TOKEN'];
   const recommended = ['SUBP', 'SCF'];
   const missing = required.filter(k => !hasCookieField(cookieStr, k));
   const missingRec = recommended.filter(k => !hasCookieField(cookieStr, k));
@@ -199,6 +212,18 @@ function classifyBackendError(err) {
     };
   }
 
+  // SSL/TLS certificate errors (handled by our agents, but log if still occurs)
+  const sslError = /self-signed|certificate|SSL|TLS|ERR_TLS_CERT_ALTNAME_INVALID|EPROTO|ERR_SSL/i.test(msg) ||
+                   /self-signed|certificate|SSL|TLS/i.test(code);
+  if (sslError) {
+    console.error('🔒 SSL Certificate Issue:', msg || code);
+    return {
+      type: 'ssl_certificate_error',
+      reason: '证书验证失败',
+      detail: '可能是系统时间不准确或代理干扰。请检查系统时间是否正确（应为 UTC+8 如果在中国），或者如果使用代理，请尝试关闭代理再试。',
+    };
+  }
+
   return {
     type: 'unknown_error',
     reason: '未知错误',
@@ -222,10 +247,10 @@ async function validateCookieLive(cookieStr, proxy = '') {
         try {
           return { httpsAgent: new HttpsProxyAgent(proxy.trim()), proxy: false };
         } catch {
-          return {};
+          return { httpsAgent: defaultHttpsAgent };
         }
       })()
-    : {};
+    : { httpsAgent: defaultHttpsAgent };
 
   const commonHeaders = {
     'Cookie': cookieStr,
@@ -267,7 +292,6 @@ async function validateCookieLive(cookieStr, proxy = '') {
   };
 
   const urls = [
-    'https://weibo.com/ajax/profile/info',
     'https://weibo.com/ajax/statuses/mymblog?page=1&feature=0',
   ];
 
@@ -538,6 +562,26 @@ async function ensureAccountIdsAndPersist() {
 }
 
 // ── accounts ──────────────────────────────────────────────
+app.post('/api/accounts/dedup', async (req, res) => {
+  try {
+    const all = await ensureAccountIdsAndPersist();
+    const seen = new Set();
+    const deduped = all.filter(a => {
+      const key = String(a.accountId ?? '').trim() || String(a.cookie ?? '').slice(0, 40);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (deduped.length < all.length) {
+      await setAccounts(deduped);
+      console.log(`[dedup] Removed ${all.length - deduped.length} duplicate accounts (${all.length} → ${deduped.length})`);
+    }
+    res.json({ ok: true, before: all.length, after: deduped.length, removed: all.length - deduped.length, accounts: sanitizeAccountsForResponse(deduped) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get('/api/accounts', async (req, res) => {
   try {
     const accounts = await ensureAccountIdsAndPersist();
@@ -552,15 +596,19 @@ app.post('/api/accounts', async (req, res) => {
     const { accounts } = req.body;  // [{cookie, name, proxy}]
     if (!Array.isArray(accounts)) return res.status(400).json({ ok: false, error: 'accounts must be array' });
     const existing = await ensureAccountIdsAndPersist();
+    // Build a lookup map by accountId so deletions/reorders don't cause positional mismatches
+    const existingById = new Map(existing.map(e => [String(e.accountId ?? ''), e]));
     const clean = (await Promise.all(accounts.map(async (a, i) => {
         const name = String(a.name ?? '').trim();
         const incomingCookie = String(a.cookie ?? '').trim();
         const keepExisting = !!a.keepExisting;
-        const cookie = incomingCookie || (keepExisting ? String(existing[i]?.cookie ?? '').trim() : '');
+        // Look up by accountId first; fall back to positional only for brand-new accounts (no accountId yet)
+        const existingAccount = existingById.get(String(a.accountId ?? '')) ?? (a.accountId ? null : existing[i]);
+        const cookie = incomingCookie || (keepExisting ? String(existingAccount?.cookie ?? '').trim() : '');
         const proxy = String(a.proxy ?? '').trim();
-        let uid = keepExisting && !incomingCookie ? String(existing[i]?.uid ?? '').trim() : '';
+        let uid = keepExisting && !incomingCookie ? String(existingAccount?.uid ?? '').trim() : '';
         // Generate stable accountId: use existing if available, otherwise create new UUID
-        const accountId = String(a.accountId ?? existing[i]?.accountId ?? randomUUID()).trim();
+        const accountId = String(a.accountId ?? existingAccount?.accountId ?? randomUUID()).trim();
 
         if (incomingCookie) {
           try {
@@ -575,6 +623,24 @@ app.post('/api/accounts', async (req, res) => {
       }))).filter(a => a.cookie);
     await setAccounts(clean);
     res.json({ ok: true, count: clean.length, accounts: sanitizeAccountsForResponse(clean) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/accounts', async (req, res) => {
+  try {
+    const { index } = req.body;
+    if (typeof index !== 'number' || !Number.isInteger(index)) {
+      return res.status(400).json({ ok: false, error: 'index must be an integer' });
+    }
+    const existing = await ensureAccountIdsAndPersist();
+    if (index < 0 || index >= existing.length) {
+      return res.status(400).json({ ok: false, error: `index ${index} out of range` });
+    }
+    existing.splice(index, 1);
+    await setAccounts(existing);
+    res.json({ ok: true, count: existing.length, accounts: sanitizeAccountsForResponse(existing) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -625,7 +691,7 @@ app.post('/api/accounts/:index/reset-browser', async (req, res) => {
     if (idx >= accounts.length) {
       return res.status(404).json({ ok: false, error: `账号 ${idx + 1} 不存在` });
     }
-    const result = await resetBrowserProfile({ accountIndex: idx, accountName: accounts[idx]?.name ?? '' });
+    const result = await resetBrowserProfile({ accountIndex: idx, accountId: accounts[idx]?.accountId ?? '', accountName: accounts[idx]?.name ?? '' });
     if (result.error) {
       return res.status(500).json({ ok: false, error: result.error });
     }
@@ -712,6 +778,7 @@ app.post('/api/accounts/:index/refresh-cookie', async (req, res) => {
     const maxWaitMs = Math.min(10 * 60 * 1000, Math.max(30 * 1000, Number.parseInt(req.body?.maxWaitMs ?? 180000, 10) || 180000));
     const refreshed = await refreshCookieViaManualLogin({
       accountIndex: idx,
+      accountId: accounts[idx]?.accountId ?? '',
       accountName: accounts[idx]?.name ?? '',
       proxy: accounts[idx]?.proxy ?? '',
       maxWaitMs,
@@ -896,6 +963,7 @@ app.get('/api/accounts/:index/qr-login/status', async (req, res) => {
       uid: live.valid && live.uid ? String(live.uid) : String(a.uid ?? '').trim(),
     } : a));
     await setAccounts(updated);
+
     const clean = sanitizeAccountsForResponse(updated);
 
     refreshLocks.delete(idx);
@@ -904,7 +972,10 @@ app.get('/api/accounts/:index/qr-login/status', async (req, res) => {
     return res.json({
       ok: true,
       ...status,
-      account: clean[idx],
+      account: {
+        ...clean[idx],
+        cookie: refreshedCookie,
+      },
       validated: {
         valid: !!live.valid,
         uid: live.uid,
@@ -1216,6 +1287,7 @@ app.get('/api/accounts/:index/open-weibo', async (req, res) => {
       timeout: 30_000,
       maxRedirects: 10,
       responseType: 'arraybuffer',
+      httpsAgent: defaultHttpsAgent,
     });
 
     console.log(`[open-weibo] got response status: ${response.status}, content-type: ${response.headers['content-type']}`);
@@ -1245,6 +1317,7 @@ app.get('/api/accounts/:index/open-weibo', async (req, res) => {
             timeout: 30_000,
             maxRedirects: 5,
             responseType: 'arraybuffer',
+            httpsAgent: defaultHttpsAgent,
           });
           console.log(`[open-weibo] redirect response status: ${redirectResponse.status}`);
           
@@ -2181,6 +2254,16 @@ async function start() {
     console.warn('[cookieRefresh] On Ubuntu, run: npx playwright install ; npx playwright install-deps');
   }
 
+  // Pre-connect to MongoDB before starting the HTTP server so the connection
+  // is cached and ready for migration and startup tasks (avoids ECONNRESET on first use).
+  if (isDBConfigured()) {
+    try {
+      await connectDB();
+    } catch (err) {
+      console.error(`❌ MongoDB pre-connect failed: ${err.message}`);
+    }
+  }
+
   const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`✅ Weibo backend listening on http://0.0.0.0:${PORT}`);
     
@@ -2222,12 +2305,12 @@ async function start() {
   // Graceful shutdown handlers
   process.on('SIGTERM', () => {
     console.log(`\n⚠️  SIGTERM received at ${new Date().toISOString()}, gracefully shutting down...`);
-    server.close(() => process.exit(0));
+    server.close(async () => { try { await closeDB(); } catch { /* ignore */ } process.exit(0); });
   });
 
   process.on('SIGINT', () => {
     console.log(`\n⚠️  SIGINT received at ${new Date().toISOString()}, gracefully shutting down...`);
-    server.close(() => process.exit(0));
+    server.close(async () => { try { await closeDB(); } catch { /* ignore */ } process.exit(0); });
   });
 
   // Catch uncaught exceptions

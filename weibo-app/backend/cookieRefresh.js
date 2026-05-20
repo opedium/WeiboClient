@@ -5,7 +5,7 @@
  * 
  * 1. REQUIRED FIELDS (Critical for session validity)
  *    - SUB: Core Weibo session identifier
- *    - XSRF-TOKEN: CSRF protection token (required for POST requests)
+ *    - X-CSRF-TOKEN: CSRF protection token (required for POST requests)
  *    Without both, the session is invalid and will be rejected.
  * 
  * 2. SUPPLEMENTARY FIELDS (Make cookies more resilient)
@@ -110,8 +110,34 @@ function getQrSession(sessionId) {
 async function closeQrSessionContext(sessionId) {
   const session = qrSessions.get(sessionId);
   if (!session) return;
-  if (session.context) {
-    try { await session.context.close(); } catch {}
+  
+  const { context, userDataDir, sessionId: sid } = session;
+  
+  if (context) {
+    try { 
+      await context.close(); 
+      
+      // On headless systems, profile directory may not flush immediately
+      // Wait and verify the Default directory was created
+      if (userDataDir && session.status === 'success') {
+        const defaultDir = path.join(userDataDir, 'Default');
+        let retries = 0;
+        const maxRetries = 10;
+        
+        while (retries < maxRetries && !fs.existsSync(defaultDir)) {
+          await new Promise(r => setTimeout(r, 100));
+          retries++;
+        }
+        
+        if (fs.existsSync(defaultDir)) {
+          console.log(`[QR Profile] ${userDataDir}: ✓ Profile persisted after ${retries} retries`);
+        } else {
+          console.warn(`[QR Profile] ${userDataDir}: ⚠ Profile directory not found after ${maxRetries * 100}ms`);
+        }
+      }
+    } catch (e) {
+      console.error(`[QR Close Error]: ${e.message}`);
+    }
     session.context = null;
   }
 }
@@ -244,7 +270,7 @@ async function monitorQrSession(sessionId) {
           
           const cookieStr = toCookieString(allCookies);
           const hasSub = hasCookieField(cookieStr, 'SUB');
-          const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+          const hasXsrf = hasCookieField(cookieStr, 'X-CSRF-TOKEN');
           
           // Log every 15th poll or when we have partial cookies
           if (pollCount % 15 === 1 || (hasSub !== hasXsrf)) {
@@ -256,11 +282,47 @@ async function monitorQrSession(sessionId) {
           if (hasRequiredSessionCookies(cookieStr)) {
             const s = qrSessions.get(sessionId);
             if (s && s.status === 'pending') {
+              // Navigate to weibo.com main page so Weibo sets XSRF-TOKEN before we close the context
+              if (!hasCookieField(cookieStr, 'XSRF-TOKEN')) {
+                try {
+                  const page = context.pages()[0] ?? await context.newPage();
+                  await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+                  await new Promise(r => setTimeout(r, 2000));
+                  const freshCookies = await context.cookies(['https://weibo.com', 'https://www.weibo.com']);
+                  const freshStr = toCookieString([...allCookies, ...freshCookies]);
+                  if (hasCookieField(freshStr, 'XSRF-TOKEN')) {
+                    allCookies = [...allCookies, ...freshCookies];
+                    console.log(`[QR Monitor] ${accountLabel}: Captured XSRF-TOKEN after weibo.com navigation`);
+                  }
+                } catch (navErr) {
+                  console.log(`[QR Monitor] ${accountLabel}: weibo.com nav for XSRF-TOKEN failed: ${navErr.message}`);
+                }
+              }
+
+              const finalCookieStr = toCookieString(allCookies);
               s.status = 'success';
-              s.cookie = cookieStr;
+              s.cookie = finalCookieStr;
               s.completedAt = new Date().toISOString();
-              console.log(`[QR Monitor] ${accountLabel}: ✅ Success after ${elapsed}ms (${pollCount} polls, navigation=${navigationDetected}). Cookies: ${cookieStr.length} chars`);
+              console.log(`[QR Monitor] ${accountLabel}: ✅ Success after ${elapsed}ms (${pollCount} polls, navigation=${navigationDetected}). Cookies: ${finalCookieStr.length} chars, hasXSRF=${hasCookieField(finalCookieStr, 'XSRF-TOKEN')}`);
               await closeQrSessionContext(sessionId);
+              
+              // Wait and verify profile was persisted
+              if (s.userDataDir) {
+                const defaultDir = path.join(s.userDataDir, 'Default');
+                let profileReady = fs.existsSync(defaultDir);
+                let waitCount = 0;
+                while (!profileReady && waitCount < 5) {
+                  await new Promise(r => setTimeout(r, 200));
+                  profileReady = fs.existsSync(defaultDir);
+                  waitCount++;
+                }
+                if (profileReady) {
+                  const cookiesFile = fs.existsSync(path.join(defaultDir, 'Cookies'));
+                  console.log(`[QR Monitor] ${accountLabel}: Profile persisted (waitCount=${waitCount}, cookiesFile=${cookiesFile})`);
+                } else {
+                  console.warn(`[QR Monitor] ${accountLabel}: ⚠️ Profile NOT persisted after close (checked ${waitCount} times)`);
+                }
+              }
               return;
             }
           }
@@ -307,6 +369,7 @@ export async function startQrLoginSession({ accountIndex, accountId = '', accoun
     headless: true,
     executablePath: edgePath || undefined,
     proxy: proxyConfig || undefined,
+    ignoreHTTPSErrors: true,
   });
   
   const launchWithTimeout = Promise.race([
@@ -343,6 +406,7 @@ export async function startQrLoginSession({ accountIndex, accountId = '', accoun
       expiresAt: now + ttlMs,
       qrDataUrl,
       context,
+      userDataDir,  // Store profile path for verification after close
       cookie: '',
       error: null,
       completedAt: null,
@@ -408,7 +472,7 @@ export async function checkPlaywrightRuntime() {
   let browser;
   try {
     const edgePath = getEdgeExecutablePath();
-    browser = await chromium.launch({ headless: true, executablePath: edgePath || undefined });
+    browser = await chromium.launch({ headless: true, executablePath: edgePath || undefined, ignoreHTTPSErrors: true });
     await browser.close();
     return { ok: true };
   } catch (error) {
@@ -422,8 +486,8 @@ function hasCookieField(cookieStr, key) {
 }
 
 function hasRequiredSessionCookies(cookieStr) {
-  // Keep aligned with backend validator: required = SUB + XSRF-TOKEN.
-  return hasCookieField(cookieStr, 'SUB') && hasCookieField(cookieStr, 'XSRF-TOKEN');
+  // Keep aligned with backend validator: required = SUB + X-CSRF-TOKEN.
+  return hasCookieField(cookieStr, 'SUB') && hasCookieField(cookieStr, 'X-CSRF-TOKEN');
 }
 
 function slugify(v) {
@@ -511,29 +575,23 @@ async function gotoWithRetry(page, url, { timeoutMs, attempts = 2, waitUntil = '
 
 async function touchSessionLightweight(context, timeoutMs) {
   // Avoid full-page rendering (which pulls heavy sinaimg assets through proxy).
-  // These endpoints are enough to validate and refresh authenticated session activity.
-  const endpoints = [
-    'https://weibo.com/ajax/profile/info',
-    'https://weibo.com/ajax/statuses/mymblog?page=1&feature=0',
-  ];
-  for (const url of endpoints) {
-    try {
-      await context.request.get(url, {
-        timeout: timeoutMs,
-        failOnStatusCode: false,
-        headers: {
-          'Accept': 'application/json, text/plain, */*',
-          'x-requested-with': 'XMLHttpRequest',
-          'Referer': 'https://weibo.com',
-          'Origin': 'https://weibo.com',
-        },
-      });
-      return;
-    } catch {
-      // Try next endpoint.
-    }
+  // Use endpoint that doesn't require uid parameter (ajax/profile/info needs uid).
+  const endpoint = 'https://weibo.com/ajax/statuses/mymblog?page=1&feature=0';
+  try {
+    await context.request.get(endpoint, {
+      timeout: timeoutMs,
+      failOnStatusCode: false,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'x-requested-with': 'XMLHttpRequest',
+        'Referer': 'https://weibo.com',
+        'Origin': 'https://weibo.com',
+      },
+    });
+    return;
+  } catch (err) {
+    throw new Error(`LIGHTWEIGHT_TOUCH_FAILED: ${err.message}`);
   }
-  throw new Error('LIGHTWEIGHT_TOUCH_FAILED');
 }
 
 function profileHasSession(userDataDir) {
@@ -701,6 +759,7 @@ async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
       headless: true,
       executablePath: edgePath || undefined,
       proxy: proxyConfig || undefined,
+      ignoreHTTPSErrors: true,
     });
     
     const launchWithTimeout = Promise.race([
@@ -736,14 +795,14 @@ async function refreshCookieHeadless({ userDataDir, proxy = '' }) {
       
       // Track what we have for diagnostics
       const hasSub = hasCookieField(cookieStr, 'SUB');
-      const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+      const hasXsrf = hasCookieField(cookieStr, 'X-CSRF-TOKEN');
       const hasSubp = hasCookieField(cookieStr, 'SUBP');
       const hasScf = hasCookieField(cookieStr, 'SCF');
       
       if (hasSub !== lastSeenPartialCookies.hasSub || hasXsrf !== lastSeenPartialCookies.hasXsrf) {
         const fields = [];
         if (hasSub) fields.push('SUB');
-        if (hasXsrf) fields.push('XSRF-TOKEN');
+        if (hasXsrf) fields.push('X-CSRF-TOKEN');
         if (hasSubp) fields.push('SUBP');
         if (hasScf) fields.push('SCF');
         console.log(`    [cookie check] found fields: ${fields.length > 0 ? fields.join(', ') : 'none'}`);
@@ -890,8 +949,8 @@ function killChromiumForProfile(userDataDir) {
  * Reset: delete the persistent Chromium profile for an account so the next
  * refresh starts from a clean slate (no stale cookies, cache, or session state).
  */
-export async function resetBrowserProfile({ accountIndex, accountName = '' }) {
-  const userDataDir = profileDirForAccount(accountIndex, accountName);
+export async function resetBrowserProfile({ accountIndex, accountId = '', accountName = '' }) {
+  const userDataDir = profileDirForAccount(accountId || `idx-${accountIndex}`);
   if (!fs.existsSync(userDataDir)) {
     return { reset: false, userDataDir };
   }
@@ -988,9 +1047,9 @@ async function monitorCaptchaSession(sessionId) {
 
       // Debug: log cookies detected
       const hasSub = hasCookieField(cookieStr, 'SUB');
-      const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+      const hasXsrf = hasCookieField(cookieStr, 'X-CSRF-TOKEN');
       if (checkCount % 10 === 1) { // Log every ~20 seconds
-        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... check #${checkCount}: SUB=${hasSub}, XSRF-TOKEN=${hasXsrf}, cookies=${cookieStr.split(';').length} items`);
+        console.log(`[CAPTCHA] Session ${sessionId.slice(0, 8)}... check #${checkCount}: SUB=${hasSub}, X-CSRF-TOKEN=${hasXsrf}, cookies=${cookieStr.split(';').length} items`);
       }
 
       // If session cookies are present, assume CAPTCHA was solved
@@ -1151,10 +1210,10 @@ async function validateCookieBasic(cookieStr) {
   // Check required fields
   if (!hasRequiredSessionCookies(cookieStr)) {
     const hasSub = hasCookieField(cookieStr, 'SUB');
-    const hasXsrf = hasCookieField(cookieStr, 'XSRF-TOKEN');
+    const hasXsrf = hasCookieField(cookieStr, 'X-CSRF-TOKEN');
     const missing = [];
     if (!hasSub) missing.push('SUB');
-    if (!hasXsrf) missing.push('XSRF-TOKEN');
+    if (!hasXsrf) missing.push('X-CSRF-TOKEN');
     return { valid: false, reason: `缺少必要字段: ${missing.join(', ')}`, health: 'critical' };
   }
   
@@ -1180,9 +1239,9 @@ async function validateCookieBasic(cookieStr) {
  * - If the account profile already has a saved session, tries a headless refresh first.
  * - Falls back to QR login if headless refresh fails for any reason.
  */
-export async function refreshCookieViaManualLogin({ accountIndex, accountName = '', proxy = '', maxWaitMs = 180000, allowVisibleBrowser = false }) {
+export async function refreshCookieViaManualLogin({ accountIndex, accountId = '', accountName = '', proxy = '', maxWaitMs = 180000, allowVisibleBrowser = false }) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
-  const userDataDir = profileDirForAccount(accountIndex, accountName);
+  const userDataDir = profileDirForAccount(accountId || `idx-${accountIndex}`);
   fs.mkdirSync(userDataDir, { recursive: true });
 
   return withProfileLock(userDataDir, async () => {
@@ -1212,7 +1271,7 @@ export async function openAccountInBrowser({ accountIndex, accountName = '', coo
   }
 
   if (!hasRequiredSessionCookies(cookieString)) {
-    return { ok: false, error: 'Cookie 无效（缺少 SUB 或 XSRF-TOKEN）' };
+    return { ok: false, error: 'Cookie 无效（缺少 SUB 或 X-CSRF-TOKEN）' };
   }
 
   // Detect if we're on a server without GUI (headless)

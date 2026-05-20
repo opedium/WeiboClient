@@ -1,12 +1,20 @@
 // weibo.js — Node.js Weibo API client
+
+// Disable SSL verification at Node.js process level
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import https from 'https';
 import yaml from 'js-yaml';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Allow self-signed certificates
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 const COOKIES_PATH = path.resolve(__dirname, '../../cookies.yaml');
 const WEIBO_HTTP_TIMEOUT_MS = Math.max(
   10_000,
@@ -73,7 +81,10 @@ function getCookieItem(key, cookieStr) {
   return match ? match[1] : null;
 }
 
-function makeHeaders(cookieStr) {
+function makeHeaders(cookieStr, xsrfOverride = null) {
+  const rawToken = xsrfOverride ?? getCookieItem('XSRF-TOKEN', cookieStr) ?? getCookieItem('X-CSRF-TOKEN', cookieStr) ?? '';
+  let csrfToken = rawToken;
+  try { csrfToken = decodeURIComponent(rawToken); } catch { /* use raw value */ }
   return {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Cookie': cookieStr,
@@ -81,7 +92,7 @@ function makeHeaders(cookieStr) {
     'origin': 'https://weibo.com',
     'referer': 'https://weibo.com',
     'Content-Type': 'application/x-www-form-urlencoded',
-    'x-xsrf-token': getCookieItem('XSRF-TOKEN', cookieStr) ?? '',
+    'x-xsrf-token': csrfToken
   };
 }
 
@@ -96,12 +107,40 @@ export function createClient(cookieOrIndex = 0, cookieList = null, proxy = null)
     if (!cookies.length) throw new Error('No web cookies available');
     cookie = cookies[Math.min(cookieOrIndex, cookies.length - 1)];
   }
-  const headers = makeHeaders(cookie);
+  let headers = makeHeaders(cookie);
 
   const agent = (proxy && typeof proxy === 'string' && proxy.trim())
     ? (() => { try { return new HttpsProxyAgent(proxy.trim()); } catch { return undefined; } })()
     : undefined;
-  const proxyOpts = agent ? { httpsAgent: agent, proxy: false } : {};
+  const finalAgent = agent || httpsAgent;
+  const proxyOpts = { httpsAgent: finalAgent, ...(agent ? { proxy: false } : {}) };
+
+  // Fetch a fresh XSRF-TOKEN from weibo.com if the stored cookie is missing it.
+  // Weibo sets XSRF-TOKEN via Set-Cookie on any authenticated page load.
+  async function ensureXsrfToken() {
+    if (getCookieItem('XSRF-TOKEN', cookie)) return; // already present
+    const urlsToTry = ['https://weibo.com', 'https://www.weibo.com/myprofile'];
+    for (const url of urlsToTry) {
+      try {
+        const resp = await axios.get(url, {
+          headers: { 'User-Agent': headers['User-Agent'], 'Cookie': cookie },
+          validateStatus: () => true,
+          maxRedirects: 5,
+          timeout: WEIBO_HTTP_TIMEOUT_MS,
+          httpsAgent: finalAgent,
+          ...(agent ? { proxy: false } : {}),
+        });
+        const setCookies = [].concat(resp.headers['set-cookie'] ?? []);
+        for (const sc of setCookies) {
+          const m = sc.match(/^XSRF-TOKEN=([^;]+)/);
+          if (m) {
+            headers = makeHeaders(cookie, m[1]);
+            return;
+          }
+        }
+      } catch { /* try next url */ }
+    }
+  }
 
   const post = (url, data) =>
     axios.post(url, new URLSearchParams(data).toString(), {
@@ -136,7 +175,8 @@ export function createClient(cookieOrIndex = 0, cookieList = null, proxy = null)
   return {
     accountCount: cookies?.length ?? 1,
 
-    postTweet({ content, pid = '', mid = '', videoTitle = '', videoType = 0 }) {
+    async postTweet({ content, pid = '', mid = '', videoTitle = '', videoType = 0 }) {
+      await ensureXsrfToken();
       const mediaInfo = mid ? JSON.stringify({
         titles: [{ title: videoTitle, default: 'true' }],
         covers: [{ pid }],

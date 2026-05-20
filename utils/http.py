@@ -7,9 +7,13 @@
 # @Project:     数据采集脚本库
 
 import requests
+import urllib3
 from functools import wraps
 from config import REQUEST_RETRY_TIMES
 from utils.log import get_logger
+
+# Disable SSL verification warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = get_logger(__name__)
 
@@ -39,6 +43,7 @@ def do_request(api, method='GET', timeout=None, retry=REQUEST_RETRY_TIMES):
                                             files=file,
                                             headers=headers,
                                             timeout=ctimeout,
+                                            verify=False,
                                             **kws)
                 if as_text:
                     data = response.text

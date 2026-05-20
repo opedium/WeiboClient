@@ -80,7 +80,7 @@ class WeiBoClient(object):
             'origin': 'https://weibo.com',
             'referer': 'https://weibo.com',
             'Content-Type': 'application/x-www-form-urlencoded',
-            'x-xsrf-token': get_cookie_item('XSRF-TOKEN', self.web_cookie),
+            'x-xsrf-token': get_cookie_item('XSRF-TOKEN', self.web_cookie) or get_cookie_item('X-CSRF-TOKEN', self.web_cookie),
         }
     
     @save_into_mongo(collectionName='用户信息精简版', differ='uid')
